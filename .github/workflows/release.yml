@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/nexview.exe dist/
+          cd dist && 7z a ../NexView-Windows-x64.zip nexview.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: NexView-Windows-x64.zip
+
+  build-macos-intel:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Create App Bundle
+        run: |
+          mkdir -p "NexView.app/Contents/MacOS"
+          mkdir -p "NexView.app/Contents/Resources"
+          cp target/release/nexview "NexView.app/Contents/MacOS/"
+          cat > "NexView.app/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>NexView</string>
+            <key>CFBundleDisplayName</key>
+            <string>NexView</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.fahrenheitresearch.nexview</string>
+            <key>CFBundleVersion</key>
+            <string>0.3.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.3.0</string>
+            <key>CFBundleExecutable</key>
+            <string>nexview</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.15</string>
+          </dict>
+          </plist>
+          PLIST
+      - name: Package DMG
+        run: |
+          hdiutil create -volname "NexView" -srcfolder "NexView.app" -ov -format UDZO NexView-macOS-Intel.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-build
+          path: NexView-macOS-Intel.dmg
+
+  build-macos-arm:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Create App Bundle
+        run: |
+          mkdir -p "NexView.app/Contents/MacOS"
+          mkdir -p "NexView.app/Contents/Resources"
+          cp target/release/nexview "NexView.app/Contents/MacOS/"
+          cat > "NexView.app/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>NexView</string>
+            <key>CFBundleDisplayName</key>
+            <string>NexView</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.fahrenheitresearch.nexview</string>
+            <key>CFBundleVersion</key>
+            <string>0.3.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.3.0</string>
+            <key>CFBundleExecutable</key>
+            <string>nexview</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+      - name: Package DMG
+        run: |
+          hdiutil create -volname "NexView" -srcfolder "NexView.app" -ov -format UDZO NexView-macOS-AppleSilicon.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm-build
+          path: NexView-macOS-AppleSilicon.dmg
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/nexview dist/
+          cd dist && tar czf ../NexView-Linux-x64.tar.gz nexview
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: NexView-Linux-x64.tar.gz
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+      - name: Build Android library
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
+          cargo build --release --target aarch64-linux-android --lib 2>&1 || echo "Android build requires additional setup - see README"
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/libnexview.so dist/ 2>/dev/null || echo "No .so produced"
+          echo "Android build experimental - requires wrapper APK project" > dist/README.txt
+          cd dist && tar czf ../NexView-Android-arm64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: NexView-Android-arm64.tar.gz
+
+  create-release:
+    needs: [build-windows, build-macos-intel, build-macos-arm, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/windows-build/NexView-Windows-x64.zip
+            artifacts/macos-intel-build/NexView-macOS-Intel.dmg
+            artifacts/macos-arm-build/NexView-macOS-AppleSilicon.dmg
+            artifacts/linux-build/NexView-Linux-x64.tar.gz
