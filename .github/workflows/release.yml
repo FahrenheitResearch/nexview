@@ -57,9 +57,9 @@ jobs:
             <key>CFBundleIdentifier</key>
             <string>com.fahrenheitresearch.nexview</string>
             <key>CFBundleVersion</key>
-            <string>1.2.0</string>
+            <string>1.3.0</string>
             <key>CFBundleShortVersionString</key>
-            <string>1.2.0</string>
+            <string>1.3.0</string>
             <key>CFBundleExecutable</key>
             <string>nexview</string>
             <key>CFBundlePackageType</key>
@@ -106,9 +106,9 @@ jobs:
             <key>CFBundleIdentifier</key>
             <string>com.fahrenheitresearch.nexview</string>
             <key>CFBundleVersion</key>
-            <string>1.2.0</string>
+            <string>1.3.0</string>
             <key>CFBundleShortVersionString</key>
-            <string>1.2.0</string>
+            <string>1.3.0</string>
             <key>CFBundleExecutable</key>
             <string>nexview</string>
             <key>CFBundlePackageType</key>
@@ -163,17 +163,22 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body: |
-            ## NexView v1.2.0
+            ## NexView ${{ github.ref_name }}
 
             ### New Features
-            - **Multi-radar support** - Shift+Click any radar station to load multiple radars simultaneously on the map. All radars render at their geographic positions. Cyan chips in toolbar show loaded secondaries with remove buttons.
+            - **Settings window** - Gear icon opens full settings panel with opacity controls, overlay toggles, GPU rendering toggle, default station config, and GIF export
+            - **Warning opacity slider** - Adjustable opacity for NWS warning polygons
+            - **GIF export in toolbar** - Quick-access GIF button appears when animation frames are loaded
 
             ### Fixes
-            - **GPU rendering on macOS** - Fixed Metal compatibility by using Rgba8Uint storage texture format
-            - **NWS warning polygon alignment** - Fixed south/east offset caused by Mercator projection nonlinearity in radar image positioning
-            - **Warning polygons in quad mode** - Polygons now render in all quad panes
-            - **Dual/quad mutual exclusivity** - Can no longer have both modes active simultaneously
-            - 19 bug fixes from v1.1.1 (SRV computation, sounding freeze, memory leaks, etc.)
+            - **GPU rendering on Windows** - Dedicated wgpu device for compute prevents display pipeline interference. Falls back to CPU if GPU output is empty.
+            - **Sounding freeze** - Drop guard ensures fetch flag is always cleared, even on task panic
+
+            ### Previous (v1.2.0)
+            - Multi-radar support (Shift+Click)
+            - GPU rendering on macOS (Metal Rgba8Uint)
+            - NWS polygon alignment fix
+            - 19 bug fixes
 
             ### macOS Users
             If you see a Gatekeeper warning, right-click the app and select "Open", or run:
