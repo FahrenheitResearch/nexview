@@ -217,6 +217,13 @@ impl SidePanel {
                 });
         });
 
+        // GPU rendering toggle (only shown if GPU is available)
+        if app.gpu_renderer.is_some() {
+            if ui.checkbox(&mut app.gpu_rendering, "GPU Rendering").changed() {
+                app.needs_render = true;
+            }
+        }
+
         if ui.button("Save as Default").clicked() {
             app.save_as_default();
         }

@@ -2,7 +2,7 @@ use eframe::egui;
 use std::time::{Duration, Instant};
 use chrono::{Datelike, NaiveDate};
 use crate::nexrad::{Level2File, RadarProduct, sites};
-use crate::render::{RadarRenderer, MapTileManager};
+use crate::render::{RadarRenderer, MapTileManager, GpuRadarRenderer};
 use crate::render::map::{MapView, TileProvider};
 use crate::data::NexradFetcher;
 use crate::ui::{SidePanel, ControlBar};
@@ -100,11 +100,19 @@ pub struct RadarApp {
     pub anim_download_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(usize, Vec<u8>)>>,
     pub anim_pending_frames: Vec<Option<Level2File>>, // sparse vec filled as downloads complete
     pub anim_received_count: usize, // how many frames received so far
+    pub anim_download_index_map: Vec<usize>, // maps download index -> anim frame index (for partial preload)
     pub pending_auto_anim: bool, // auto-load animation when file list arrives
+    pub pending_anim_prerender: bool, // trigger pre-render on next update
 
     // Pre-rendered animation textures
     pub anim_textures: Vec<Option<egui::TextureHandle>>,
     pub anim_quad_textures: Vec<[Option<egui::TextureHandle>; 4]>,
+
+    // Background preloading
+    pub preload_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(usize, Vec<u8>)>>,
+    pub preloaded_data: Vec<Option<Vec<u8>>>,
+    pub preload_keys: Vec<String>,
+    pub preload_count: usize,
 
     // Wall mode (multi-radar)
     pub wall_mode: bool,
@@ -121,6 +129,14 @@ pub struct RadarApp {
 
     // Settings
     pub settings: AppSettings,
+
+    // GPU rendering
+    pub gpu_renderer: Option<GpuRadarRenderer>,
+    pub gpu_rendering: bool,
+
+    // Rendering state — range_km from last render, used for consistent overlay positioning
+    pub last_render_range_km: Option<f64>,
+    pub quad_render_range_km: [Option<f64>; 4],
 
     // Performance stats
     pub perf: PerfStats,
@@ -168,7 +184,7 @@ pub struct PerfStats {
 }
 
 impl RadarApp {
-    pub fn new(_cc: &eframe::CreationContext) -> Self {
+    pub fn new(cc: &eframe::CreationContext) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         let handle = runtime.handle().clone();
 
@@ -176,6 +192,17 @@ impl RadarApp {
 
         let fetcher = NexradFetcher::new(handle.clone());
         let tile_manager = MapTileManager::new(handle);
+
+        // Try to initialize GPU compute renderer
+        let gpu_renderer = cc.wgpu_render_state.as_ref().map(|rs| {
+            log::info!("Initializing GPU compute radar renderer");
+            GpuRadarRenderer::new(rs)
+        });
+        if gpu_renderer.is_some() {
+            log::info!("GPU radar renderer initialized successfully");
+        } else {
+            log::warn!("No wgpu render state available; GPU rendering disabled");
+        }
 
         let station = settings.default_station.clone();
         let zoom = settings.default_zoom;
@@ -210,6 +237,11 @@ impl RadarApp {
             date_month: chrono::Utc::now().month(),
             date_day: chrono::Utc::now().day(),
 
+            preload_rx: None,
+            preloaded_data: Vec::new(),
+            preload_keys: Vec::new(),
+            preload_count: 10,
+
             wall_mode: false,
             wall_panels: Vec::new(),
             wall_loading_index: 0,
@@ -227,7 +259,9 @@ impl RadarApp {
             anim_download_rx: None,
             anim_pending_frames: Vec::new(),
             anim_received_count: 0,
+            anim_download_index_map: Vec::new(),
             pending_auto_anim: false,
+            pending_anim_prerender: false,
 
             anim_textures: Vec::new(),
             anim_quad_textures: Vec::new(),
@@ -243,6 +277,11 @@ impl RadarApp {
             cursor_lon: 0.0,
 
             color_preset: crate::render::color_table::ColorTablePreset::Default,
+
+            gpu_renderer,
+            gpu_rendering: false,
+            last_render_range_km: None,
+            quad_render_range_km: [None; 4],
 
             settings: AppSettings::load(),
 
@@ -469,9 +508,71 @@ impl RadarApp {
         self.anim_pending_frames = vec![None; num_keys];
         self.anim_received_count = 0;
 
-        // Start parallel downloads (up to 4 concurrent)
-        let rx = self.fetcher.download_files_parallel(keys);
-        self.anim_download_rx = Some(rx);
+        // Check which keys are already preloaded
+        let mut keys_to_download = Vec::new();
+        let mut download_index_map = Vec::new(); // maps download index -> anim frame index
+        let mut preload_hits = 0;
+
+        for (anim_idx, key) in keys.iter().enumerate() {
+            // Look up this key in preload_keys
+            let preload_match = self.preload_keys.iter().position(|pk| pk == key);
+            if let Some(preload_idx) = preload_match {
+                if let Some(Some(data)) = self.preloaded_data.get(preload_idx) {
+                    // Parse the preloaded data directly
+                    match Level2File::parse(data) {
+                        Ok(file) => {
+                            self.anim_pending_frames[anim_idx] = Some(file);
+                            self.anim_received_count += 1;
+                            preload_hits += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse preloaded frame {}: {}", key, e);
+                            // Fall through to download
+                        }
+                    }
+                }
+            }
+            keys_to_download.push(key.clone());
+            download_index_map.push(anim_idx);
+        }
+
+        if preload_hits > 0 {
+            log::info!("Animation: {} of {} frames from preload cache, {} to download",
+                preload_hits, num_keys, keys_to_download.len());
+        }
+
+        // Clear preload data since we've consumed it
+        self.preloaded_data.clear();
+        self.preload_keys.clear();
+        self.preload_rx = None;
+
+        if keys_to_download.is_empty() {
+            // All frames were preloaded — finalize immediately
+            self.anim_frames = self.anim_pending_frames
+                .iter_mut()
+                .filter_map(|slot| slot.take())
+                .collect();
+            self.anim_pending_frames.clear();
+            self.anim_loading = false;
+            self.anim_playing = true;
+            self.anim_last_advance = Some(Instant::now());
+            if !self.anim_frames.is_empty() {
+                self.current_file = Some(self.anim_frames[0].clone());
+                self.needs_render = true;
+            }
+            log::info!("Animation loaded instantly from preload: {} frames", self.anim_frames.len());
+            // Schedule pre-rendering for next update() when we have ctx
+            self.pending_anim_prerender = true;
+        } else {
+            // Download remaining frames; we need to remap indices
+            // The download_files_parallel returns (download_idx, data), but we need anim_idx
+            // We'll store the mapping and handle it in check_animation_downloads
+            // For simplicity, download all remaining keys and use the index mapping
+            self.anim_download_index_map = download_index_map;
+            let rx = self.fetcher.download_files_parallel(keys_to_download);
+            self.anim_download_rx = Some(rx);
+        }
     }
 
     fn check_animation_downloads(&mut self, ctx: &egui::Context) {
@@ -486,20 +587,26 @@ impl RadarApp {
         if let Some(rx) = &mut self.anim_download_rx {
             while processed < 2 {
                 match rx.try_recv() {
-                    Ok((idx, data)) => {
+                    Ok((dl_idx, data)) => {
                         processed += 1;
+                        // Map download index to animation frame index
+                        let anim_idx = if !self.anim_download_index_map.is_empty() {
+                            self.anim_download_index_map.get(dl_idx).copied().unwrap_or(dl_idx)
+                        } else {
+                            dl_idx
+                        };
                         match Level2File::parse(&data) {
                             Ok(file) => {
-                                if idx < self.anim_pending_frames.len() {
-                                    self.anim_pending_frames[idx] = Some(file);
+                                if anim_idx < self.anim_pending_frames.len() {
+                                    self.anim_pending_frames[anim_idx] = Some(file);
                                 }
                                 self.anim_received_count += 1;
                                 log::info!("Animation frame {}/{} loaded (index {})",
-                                    self.anim_received_count, self.anim_download_queue.len(), idx);
+                                    self.anim_received_count, self.anim_download_queue.len(), anim_idx);
                             }
                             Err(e) => {
                                 self.anim_received_count += 1;
-                                log::error!("Failed to parse animation frame {}: {}", idx, e);
+                                log::error!("Failed to parse animation frame {}: {}", anim_idx, e);
                             }
                         }
                     }
@@ -715,6 +822,22 @@ impl RadarApp {
                     self.current_file = Some(file);
                     self.selected_elevation = 0;
                     self.needs_render = true;
+
+                    // Start background preloading if available_files is populated and no preload in progress
+                    if self.preload_rx.is_none() {
+                        let files = self.fetcher.available_files.lock().unwrap().clone();
+                        if files.len() > 1 {
+                            let count = self.preload_count.min(files.len() - 1);
+                            let start = files.len() - 1 - count; // exclude the last (already downloaded)
+                            let keys: Vec<String> = files[start..files.len() - 1].iter().map(|f| f.key.clone()).collect();
+                            log::info!("Starting background preload of {} frames", keys.len());
+                            self.preload_keys = keys.clone();
+                            self.preloaded_data = vec![None; keys.len()];
+                            let preload_fetcher = NexradFetcher::new(self.runtime.handle().clone());
+                            let rx = preload_fetcher.download_files_parallel(keys);
+                            self.preload_rx = Some(rx);
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to parse Level2 file: {}", e);
@@ -740,6 +863,37 @@ impl RadarApp {
         ctx.request_repaint();
     }
 
+    fn check_preload_downloads(&mut self) {
+        if self.preload_rx.is_none() {
+            return;
+        }
+
+        let mut processed = 0;
+        let total = self.preload_keys.len();
+        if let Some(rx) = &mut self.preload_rx {
+            while processed < 2 {
+                match rx.try_recv() {
+                    Ok((idx, data)) => {
+                        processed += 1;
+                        if idx < self.preloaded_data.len() {
+                            log::info!("Preloaded frame {}/{} ({} bytes)",
+                                idx + 1, total, data.len());
+                            self.preloaded_data[idx] = Some(data);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Check if all preloads are done
+        let received = self.preloaded_data.iter().filter(|d| d.is_some()).count();
+        if received >= total && total > 0 {
+            log::info!("Background preload complete: {}/{} frames cached", received, total);
+            self.preload_rx = None;
+        }
+    }
+
     fn render_radar(&mut self, ctx: &egui::Context) {
         if !self.needs_render {
             return;
@@ -758,6 +912,8 @@ impl RadarApp {
             None => return,
         };
 
+        let use_gpu = self.gpu_rendering && self.gpu_renderer.is_some();
+
         if self.quad_view {
             // Render all 4 quad products
             for (i, &product) in QUAD_PRODUCTS.iter().enumerate() {
@@ -766,10 +922,17 @@ impl RadarApp {
 
                 if let Some(sweep) = sweep {
                     let t0 = Instant::now();
-                    let rendered = RadarRenderer::render_sweep(sweep, product, site, 512);
+                    let color_table = crate::render::ColorTable::for_product_preset(product, self.color_preset);
+                    let rendered = if use_gpu {
+                        self.gpu_renderer.as_ref().unwrap()
+                            .render_sweep_gpu(sweep, product, site, 512, &color_table)
+                    } else {
+                        RadarRenderer::render_sweep(sweep, product, site, 512)
+                    };
                     self.perf.render_quad_times[i] = Some(t0.elapsed());
 
                     if let Some(rendered) = rendered {
+                        self.quad_render_range_km[i] = Some(rendered.range_km);
                         let image = egui::ColorImage::from_rgba_unmultiplied(
                             [rendered.width as usize, rendered.height as usize],
                             &rendered.pixels,
@@ -781,6 +944,7 @@ impl RadarApp {
                         ));
                     } else {
                         self.quad_textures[i] = None;
+                        self.quad_render_range_km[i] = None;
                     }
                 } else {
                     self.quad_textures[i] = None;
@@ -793,8 +957,15 @@ impl RadarApp {
         let sweep_idx = self.find_sweep_for_product(self.selected_product)
             .unwrap_or(self.selected_elevation);
         if let Some(sweep) = file.sweeps.get(sweep_idx) {
-            let rendered = RadarRenderer::render_sweep(sweep, self.selected_product, site, 1024);
+            let color_table = crate::render::ColorTable::for_product_preset(self.selected_product, self.color_preset);
+            let rendered = if use_gpu {
+                self.gpu_renderer.as_ref().unwrap()
+                    .render_sweep_gpu(sweep, self.selected_product, site, 1024, &color_table)
+            } else {
+                RadarRenderer::render_sweep(sweep, self.selected_product, site, 1024)
+            };
             if let Some(rendered) = rendered {
+                self.last_render_range_km = Some(rendered.range_km);
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [rendered.width as usize, rendered.height as usize],
                     &rendered.pixels,
@@ -809,8 +980,9 @@ impl RadarApp {
             }
         }
 
+        let render_method = if use_gpu { "GPU" } else { "CPU" };
         self.perf.render_time = Some(render_start.elapsed());
-        log::info!("Render total: {:.1}ms", render_start.elapsed().as_secs_f64() * 1000.0);
+        log::info!("Render total ({}): {:.1}ms", render_method, render_start.elapsed().as_secs_f64() * 1000.0);
     }
 
     fn draw_map(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -864,24 +1036,9 @@ impl RadarApp {
         self.tile_textures.retain(|k, _| retain_set.contains(k));
     }
 
-    fn get_radar_rect(&self, rect: egui::Rect, product: RadarProduct) -> Option<egui::Rect> {
-        let file = self.current_file.as_ref()?;
+    fn get_radar_rect_for_range(&self, rect: egui::Rect, range_km: f64) -> Option<egui::Rect> {
         let site = sites::find_site(&self.selected_station)?;
-        let sweep_idx = self.find_sweep_for_product(product)?;
-        let sweep = file.sweeps.get(sweep_idx)?;
-
-        let max_range_m = sweep.radials.iter()
-            .filter_map(|r| {
-                r.moments.iter()
-                    .filter(|m| m.product == product)
-                    .map(|m| m.first_gate_range as f64 + m.gate_count as f64 * m.gate_size as f64)
-                    .next()
-            })
-            .fold(0.0f64, f64::max);
-
-        if max_range_m <= 0.0 {
-            return None;
-        }
+        let max_range_m = range_km * 1000.0;
 
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
@@ -910,7 +1067,7 @@ impl RadarApp {
             None => return,
         };
 
-        let radar_rect = match self.get_radar_rect(rect, self.selected_product) {
+        let radar_rect = match self.last_render_range_km.and_then(|r| self.get_radar_rect_for_range(rect, r)) {
             Some(r) => r,
             None => return,
         };
@@ -961,7 +1118,7 @@ impl RadarApp {
 
             // Draw radar overlay (clipped to quadrant)
             if let Some(tex) = &self.quad_textures[i] {
-                if let Some(radar_rect) = self.get_radar_rect(quad_rect, product) {
+                if let Some(radar_rect) = self.quad_render_range_km[i].and_then(|r| self.get_radar_rect_for_range(quad_rect, r)) {
                     let clipped = ui.painter_at(quad_rect);
                     clipped.image(
                         tex.id(),
@@ -1275,7 +1432,12 @@ impl eframe::App for RadarApp {
         } else {
             self.check_downloads(ctx);
         }
+        self.check_preload_downloads();
         self.check_wall_downloads(ctx);
+        if self.pending_anim_prerender {
+            self.pending_anim_prerender = false;
+            self.pre_render_animation_textures(ctx);
+        }
         self.advance_animation();
         self.handle_keyboard(ctx);
         self.render_radar(ctx);

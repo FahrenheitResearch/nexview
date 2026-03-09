@@ -28,6 +28,11 @@ serde_json = "1"
 # Math/Geo
 nalgebra = "0.33"
 
+# GPU
+wgpu = "24"
+egui-wgpu = "0.31"
+bytemuck = { version = "1", features = ["derive"] }
+
 # Parallelism
 rayon = "1.10"
 
