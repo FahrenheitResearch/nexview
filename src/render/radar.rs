@@ -1,5 +1,6 @@
 use crate::nexrad::{Level2Sweep, RadarProduct, RadarSite};
 use crate::render::ColorTable;
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 /// Renders radar sweep data into a pixel buffer for display
@@ -69,7 +70,11 @@ impl RadarRenderer {
         // look up the correct radial and gate, and assign the color.
         // This guarantees every pixel is filled with no gaps.
         // Parallelized per-row with rayon for multi-core rendering.
-        let row_chunks: Vec<Vec<u8>> = (0..size).into_par_iter().map(|py| {
+        #[cfg(not(target_arch = "wasm32"))]
+        let iter = (0..size).into_par_iter();
+        #[cfg(target_arch = "wasm32")]
+        let iter = 0..size;
+        let row_chunks: Vec<Vec<u8>> = iter.map(|py| {
             let mut row = vec![0u8; size * 4];
             let dy = center - py as f64;
 

@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ReadBytesExt};
 use bzip2::read::BzDecoder;
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::io::{Cursor, Read};
+
+use chrono::{Datelike, NaiveDate};
 
 use super::products::RadarProduct;
 
@@ -125,6 +128,23 @@ impl Level2File {
         })
     }
 
+    /// Convert volume_date (modified Julian) and volume_time (ms since midnight)
+    /// to a formatted UTC timestamp string like "2025-01-21 18:45:32 UTC".
+    pub fn timestamp_string(&self) -> String {
+        // NEXRAD modified Julian date: days since 1970-01-01 (epoch = day 1)
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let date = epoch + chrono::Duration::days((self.volume_date as i64) - 1);
+        let total_secs = self.volume_time / 1000;
+        let hours = total_secs / 3600;
+        let minutes = (total_secs % 3600) / 60;
+        let seconds = total_secs % 60;
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            date.year(), date.month(), date.day(),
+            hours, minutes, seconds,
+        )
+    }
+
     fn decompress_archive2(raw_data: &[u8]) -> Result<Vec<u8>> {
         if raw_data.len() < VOLUME_HEADER_SIZE {
             return Err(anyhow!("Data too short for volume header"));
@@ -154,8 +174,25 @@ impl Level2File {
             pos += actual_size;
         }
 
-        // Phase 2: decompress all blocks in parallel
+        // Phase 2: decompress all blocks in parallel (or sequentially on wasm)
+        #[cfg(not(target_arch = "wasm32"))]
         let decompressed: Vec<Vec<u8>> = blocks.par_iter()
+            .map(|&(start, len, is_bz2)| {
+                let block_data = &raw_data[start..start + len];
+                if is_bz2 {
+                    let mut decoder = BzDecoder::new(block_data);
+                    let mut out = Vec::new();
+                    match decoder.read_to_end(&mut out) {
+                        Ok(_) => out,
+                        Err(_) => block_data.to_vec(),
+                    }
+                } else {
+                    block_data.to_vec()
+                }
+            })
+            .collect();
+        #[cfg(target_arch = "wasm32")]
+        let decompressed: Vec<Vec<u8>> = blocks.iter()
             .map(|&(start, len, is_bz2)| {
                 let block_data = &raw_data[start..start + len];
                 if is_bz2 {

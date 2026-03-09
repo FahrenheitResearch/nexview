@@ -279,6 +279,18 @@ impl SidePanel {
         }
 
         ui.separator();
+        ui.label("Opacity:");
+        ui.horizontal(|ui| {
+            ui.label("Radar:");
+            ui.add(egui::Slider::new(&mut app.radar_opacity, 0.0..=1.0).step_by(0.01));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Map:");
+            ui.add(egui::Slider::new(&mut app.map_opacity, 0.0..=1.0).step_by(0.01));
+        });
+        ui.checkbox(&mut app.dark_mode, "Dark Mode");
+
+        ui.separator();
         ui.label("Overlays:");
         ui.checkbox(&mut app.show_range_rings, "Range Rings");
         ui.checkbox(&mut app.show_azimuth_lines, "Azimuth Lines");
@@ -388,6 +400,16 @@ impl SidePanel {
             // Frame indicator
             let name = app.anim_frame_names.get(app.anim_index).map(|s| s.as_str()).unwrap_or("?");
             ui.label(format!("Frame {}/{}: {}", app.anim_index + 1, app.anim_frames.len(), name));
+
+            // Export GIF button
+            ui.horizontal(|ui| {
+                if ui.button("Export GIF").clicked() {
+                    app.export_loop_gif();
+                }
+                if let Some(status) = &app.gif_export_status {
+                    ui.label(status.as_str());
+                }
+            });
         }
     }
 

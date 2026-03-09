@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>NexView - NEXRAD Radar</title>
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #141420; }
+        canvas { width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <canvas id="nexview_canvas"></canvas>
+    <script type="module">
+        import init, { start } from './pkg/nexview.js';
+        async function run() {
+            await init();
+            start("nexview_canvas");
+        }
+        run();
+    </script>
+</body>
+</html>

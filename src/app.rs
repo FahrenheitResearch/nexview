@@ -97,6 +97,7 @@ pub struct RadarApp {
     pub anim_loading: bool,
     pub anim_download_queue: Vec<String>, // keys to download (kept for reference)
     pub anim_frame_count: usize, // how many frames to load
+    #[cfg(not(target_arch = "wasm32"))]
     pub anim_download_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(usize, Vec<u8>)>>,
     pub anim_pending_frames: Vec<Option<Level2File>>, // sparse vec filled as downloads complete
     pub anim_received_count: usize, // how many frames received so far
@@ -109,6 +110,7 @@ pub struct RadarApp {
     pub anim_quad_textures: Vec<[Option<egui::TextureHandle>; 4]>,
 
     // Background preloading
+    #[cfg(not(target_arch = "wasm32"))]
     pub preload_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(usize, Vec<u8>)>>,
     pub preloaded_data: Vec<Option<Vec<u8>>>,
     pub preload_keys: Vec<String>,
@@ -175,10 +177,19 @@ pub struct RadarApp {
     // Performance stats
     pub perf: PerfStats,
 
+    // GIF export
+    pub gif_export_status: Option<String>,
+
     // Help overlay
     pub show_help: bool,
 
-    // Runtime
+    // Opacity & appearance
+    pub radar_opacity: f32,
+    pub map_opacity: f32,
+    pub dark_mode: bool,
+
+    // Runtime (native only — wasm uses browser event loop)
+    #[cfg(not(target_arch = "wasm32"))]
     runtime: tokio::runtime::Runtime,
 }
 
@@ -222,7 +233,9 @@ pub struct PerfStats {
 
 impl RadarApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        #[cfg(not(target_arch = "wasm32"))]
         let handle = runtime.handle().clone();
 
         let settings = AppSettings::load();
@@ -274,6 +287,7 @@ impl RadarApp {
             date_month: chrono::Utc::now().month(),
             date_day: chrono::Utc::now().day(),
 
+            #[cfg(not(target_arch = "wasm32"))]
             preload_rx: None,
             preloaded_data: Vec::new(),
             preload_keys: Vec::new(),
@@ -293,6 +307,7 @@ impl RadarApp {
             anim_loading: false,
             anim_download_queue: Vec::new(),
             anim_frame_count: 10,
+            #[cfg(not(target_arch = "wasm32"))]
             anim_download_rx: None,
             anim_pending_frames: Vec::new(),
             anim_received_count: 0,
@@ -349,10 +364,17 @@ impl RadarApp {
 
             settings: AppSettings::load(),
 
+            gif_export_status: None,
+
             perf: PerfStats::default(),
 
             show_help: false,
 
+            radar_opacity: 0.85,
+            map_opacity: 1.0,
+            dark_mode: true,
+
+            #[cfg(not(target_arch = "wasm32"))]
             runtime,
         };
 
@@ -401,8 +423,11 @@ impl RadarApp {
         self.wall_loading_index = 0;
 
         // Create a dedicated fetcher for wall mode
-        let handle = self.runtime.handle().clone();
-        self.wall_fetcher = Some(NexradFetcher::new(handle));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle = self.runtime.handle().clone();
+            self.wall_fetcher = Some(NexradFetcher::new(handle));
+        }
 
         // Start loading the first station
         if let Some(panel) = self.wall_panels.first_mut() {
@@ -792,6 +817,76 @@ impl RadarApp {
         );
     }
 
+    /// Export the current animation loop as a GIF file.
+    pub fn export_loop_gif(&mut self) {
+        use crate::render::RadarRenderer;
+
+        if self.anim_frames.is_empty() {
+            self.gif_export_status = Some("No animation frames loaded".into());
+            log::warn!("GIF export: no animation frames loaded");
+            return;
+        }
+
+        let site = match crate::nexrad::sites::find_site(&self.selected_station) {
+            Some(s) => s,
+            None => {
+                self.gif_export_status = Some("Unknown station".into());
+                log::error!("GIF export: unknown station {}", self.selected_station);
+                return;
+            }
+        };
+
+        log::info!("Exporting {} animation frames as GIF...", self.anim_frames.len());
+
+        let orig_file = self.current_file.take();
+        let mut color_images: Vec<egui::ColorImage> = Vec::with_capacity(self.anim_frames.len());
+
+        for frame in &self.anim_frames {
+            self.current_file = Some(frame.clone());
+
+            let sweep_idx = self
+                .find_sweep_for_product(self.selected_product)
+                .unwrap_or(self.selected_elevation);
+
+            if let Some(sweep) = frame.sweeps.get(sweep_idx) {
+                if let Some(rendered) = RadarRenderer::render_sweep(
+                    sweep,
+                    self.selected_product,
+                    site,
+                    1024,
+                ) {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [rendered.width as usize, rendered.height as usize],
+                        &rendered.pixels,
+                    );
+                    color_images.push(image);
+                }
+            }
+        }
+
+        self.current_file = orig_file;
+
+        if color_images.is_empty() {
+            self.gif_export_status = Some("No frames could be rendered".into());
+            log::error!("GIF export: no frames could be rendered");
+            return;
+        }
+
+        let path = "nexview_loop.gif";
+        match crate::export::export_animation_gif(&color_images, self.anim_speed_ms as u16, path) {
+            Ok(()) => {
+                let msg = format!("Exported {} frames to {}", color_images.len(), path);
+                log::info!("GIF export: {}", msg);
+                self.gif_export_status = Some(msg);
+            }
+            Err(e) => {
+                let msg = format!("Export failed: {}", e);
+                log::error!("GIF export: {}", msg);
+                self.gif_export_status = Some(msg);
+            }
+        }
+    }
+
     fn advance_animation(&mut self) {
         if !self.anim_playing || self.anim_frames.is_empty() {
             return;
@@ -927,6 +1022,7 @@ impl RadarApp {
                             log::info!("Starting background preload of {} frames", keys.len());
                             self.preload_keys = keys.clone();
                             self.preloaded_data = vec![None; keys.len()];
+                            #[cfg(not(target_arch = "wasm32"))]
                             let preload_fetcher = NexradFetcher::new(self.runtime.handle().clone());
                             let rx = preload_fetcher.download_files_parallel(keys);
                             self.preload_rx = Some(rx);
@@ -1207,7 +1303,7 @@ impl RadarApp {
                         tex.id(),
                         tile_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        egui::Color32::from_white_alpha((self.map_opacity * 255.0) as u8),
                     );
                 }
             }
@@ -1264,7 +1360,7 @@ impl RadarApp {
             tex.id(),
             radar_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::from_white_alpha(220),
+            egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
         );
 
         // Draw radar site marker
@@ -1283,6 +1379,57 @@ impl RadarApp {
             egui::Align2::LEFT_BOTTOM,
             &self.selected_station,
             egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    /// Draw a timestamp overlay in the top-right corner of the given rect.
+    /// Shows station ID, elevation, product, and volume scan time.
+    fn draw_timestamp_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        // During animation use the current animation frame, otherwise use current_file.
+        let file = if self.anim_playing && !self.anim_frames.is_empty() {
+            Some(&self.anim_frames[self.anim_index])
+        } else {
+            self.current_file.as_ref()
+        };
+        let file = match file {
+            Some(f) => f,
+            None => return,
+        };
+
+        // Build the overlay text lines
+        let elevation_angle = file
+            .sweeps
+            .get(self.selected_elevation)
+            .map(|s| s.elevation_angle)
+            .unwrap_or(0.0);
+        let line1 = format!(
+            "{} {:.1}\u{00b0} {}",
+            file.station_id,
+            elevation_angle,
+            self.selected_product.short_name(),
+        );
+        let line2 = file.timestamp_string();
+        let text = format!("{}\n{}", line1, line2);
+
+        let font = egui::FontId::proportional(14.0);
+        let galley = ui.painter().layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
+        let text_size = galley.size();
+
+        let padding = egui::vec2(8.0, 6.0);
+        let bg_size = text_size + padding * 2.0;
+        let bg_pos = egui::pos2(rect.right() - bg_size.x - 6.0, rect.top() + 6.0);
+        let bg_rect = egui::Rect::from_min_size(bg_pos, bg_size);
+
+        // Semi-transparent dark background
+        ui.painter().rect_filled(bg_rect, 4.0, egui::Color32::from_black_alpha(180));
+
+        // White text
+        ui.painter().text(
+            bg_rect.min + padding,
+            egui::Align2::LEFT_TOP,
+            text,
+            font,
             egui::Color32::WHITE,
         );
     }
@@ -1312,7 +1459,7 @@ impl RadarApp {
                         tex.id(),
                         radar_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::from_white_alpha(220),
+                        egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
                     );
                 }
             }
@@ -1381,12 +1528,13 @@ impl RadarApp {
                     tex.id(),
                     radar_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::from_white_alpha(220),
+                    egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
                 );
             }
         }
         // Overlays on left pane
         self.draw_overlays_in_rect(ui, left_rect);
+        self.draw_timestamp_overlay(ui, left_rect);
         // Label
         ui.painter().rect_filled(
             egui::Rect::from_min_size(left_rect.min, egui::vec2(80.0, 22.0)),
@@ -1411,12 +1559,13 @@ impl RadarApp {
                     tex.id(),
                     radar_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::from_white_alpha(220),
+                    egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
                 );
             }
         }
         // Overlays on right pane
         self.draw_overlays_in_rect(ui, right_rect);
+        self.draw_timestamp_overlay(ui, right_rect);
         // Label
         ui.painter().rect_filled(
             egui::Rect::from_min_size(right_rect.min, egui::vec2(80.0, 22.0)),
@@ -1490,7 +1639,7 @@ impl RadarApp {
                         tex.id(),
                         tile_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        egui::Color32::from_white_alpha((self.map_opacity * 255.0) as u8),
                     );
                 }
             }
@@ -2187,7 +2336,12 @@ impl eframe::App for RadarApp {
                 let available_rect = ui.available_rect_before_wrap();
                 let response = ui.allocate_rect(available_rect, egui::Sense::click_and_drag());
 
-                ui.painter().rect_filled(available_rect, 0.0, egui::Color32::from_rgb(20, 20, 30));
+                let bg_color = if self.dark_mode {
+                    egui::Color32::from_rgb(20, 20, 30)
+                } else {
+                    egui::Color32::from_rgb(220, 225, 230)
+                };
+                ui.painter().rect_filled(available_rect, 0.0, bg_color);
 
                 if self.wall_mode {
                     self.draw_wall_mode(ui, available_rect);
@@ -2222,6 +2376,7 @@ impl eframe::App for RadarApp {
                 } else {
                     self.draw_map(ui, available_rect);
                     self.draw_radar_overlay(ui, available_rect);
+                    self.draw_timestamp_overlay(ui, available_rect);
                     self.draw_overlays(ui, available_rect);
                     self.draw_radar_sites(ui, available_rect);
                     self.draw_cursor_readout(ui, available_rect, self.selected_product);
