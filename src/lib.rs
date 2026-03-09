@@ -6,6 +6,7 @@ pub mod data;
 pub mod ui;
 pub mod app;
 pub mod export;
+pub mod preload;
 
 #[cfg(target_arch = "wasm32")]
 pub mod web;

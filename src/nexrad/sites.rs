@@ -165,3 +165,59 @@ pub fn find_nearest_site(lat: f64, lon: f64) -> Option<&'static RadarSite> {
         dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
     })
 }
+
+/// Great-circle distance in kilometers using the haversine formula.
+pub fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6371.0; // Earth radius in km
+    let d_lat = (lat2 - lat1).to_radians();
+    let d_lon = (lon2 - lon1).to_radians();
+    let lat1_r = lat1.to_radians();
+    let lat2_r = lat2.to_radians();
+    let a = (d_lat / 2.0).sin().powi(2)
+        + lat1_r.cos() * lat2_r.cos() * (d_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    R * c
+}
+
+/// Returns the `n` closest radar sites to the given lat/lon, sorted by distance.
+pub fn find_nearest_sites(lat: f64, lon: f64, n: usize) -> Vec<&'static RadarSite> {
+    let mut sites_with_dist: Vec<(&'static RadarSite, f64)> = RADAR_SITES
+        .iter()
+        .map(|s| (s, haversine_km(lat, lon, s.lat, s.lon)))
+        .collect();
+    sites_with_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    sites_with_dist.into_iter().take(n).map(|(s, _)| s).collect()
+}
+
+/// For each alert with polygon coordinates, find the centroid and return the
+/// nearest radar site(s). The returned list is deduplicated.
+pub fn sites_near_alerts(alerts: &[crate::data::alerts::WeatherAlert]) -> Vec<&'static RadarSite> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+
+    for alert in alerts {
+        if alert.polygon.is_empty() {
+            continue;
+        }
+        // Compute centroid of the polygon
+        let n = alert.polygon.len() as f64;
+        let (sum_lat, sum_lon) = alert.polygon.iter().fold((0.0, 0.0), |(alat, alon), &(lat, lon)| {
+            (alat + lat, alon + lon)
+        });
+        let centroid_lat = sum_lat / n;
+        let centroid_lon = sum_lon / n;
+
+        if let Some(site) = find_nearest_site(centroid_lat, centroid_lon) {
+            if seen.insert(site.id) {
+                result.push(site);
+            }
+        }
+    }
+
+    result
+}
+
+/// Returns all station IDs from the RADAR_SITES table.
+pub fn all_site_ids() -> Vec<&'static str> {
+    RADAR_SITES.iter().map(|s| s.id).collect()
+}

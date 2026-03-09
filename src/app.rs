@@ -6,6 +6,12 @@ use crate::render::{RadarRenderer, MapTileManager, GpuRadarRenderer};
 use crate::render::map::{MapView, TileProvider};
 use crate::data::{NexradFetcher, AlertFetcher, SoundingFetcher};
 use crate::ui::{SidePanel, ControlBar};
+use crate::ui::toolbar::Toolbar;
+use crate::ui::timeline::TimelineBar;
+use crate::ui::sidebar::CollapsibleSidebar;
+use crate::ui::hover_preview::HoverPreview;
+use crate::ui::national_view::NationalView;
+use crate::ui::minimap::Minimap;
 
 const SETTINGS_PATH: &str = "nexview_settings.json";
 
@@ -168,6 +174,7 @@ pub struct RadarApp {
     pub sounding_fetcher: SoundingFetcher,
     pub sounding_mode: bool,
     pub sounding_texture: Option<egui::TextureHandle>,
+    pub sounding_pending: bool,
 
     // Measurement tool
     pub measure_mode: bool,
@@ -187,6 +194,20 @@ pub struct RadarApp {
     pub radar_opacity: f32,
     pub map_opacity: f32,
     pub dark_mode: bool,
+
+    // Collapsible sidebar state
+    pub sidebar_expanded: bool,
+    pub sidebar_section: crate::ui::SidebarSection,
+
+    // New UI components
+    pub hover_preview: HoverPreview,
+    pub national_view: NationalView,
+    pub minimap: Minimap,
+    pub use_new_ui: bool,
+
+    // Preload engine
+    #[cfg(not(target_arch = "wasm32"))]
+    pub preload_engine: Option<crate::preload::PreloadEngine>,
 
     // Runtime (native only — wasm uses browser event loop)
     #[cfg(not(target_arch = "wasm32"))]
@@ -357,6 +378,7 @@ impl RadarApp {
             sounding_fetcher: SoundingFetcher::new(handle.clone()),
             sounding_mode: false,
             sounding_texture: None,
+            sounding_pending: false,
 
             measure_mode: false,
             measure_start: None,
@@ -374,14 +396,45 @@ impl RadarApp {
             map_opacity: 1.0,
             dark_mode: true,
 
+            sidebar_expanded: false,
+            sidebar_section: crate::ui::SidebarSection::Station,
+
+            hover_preview: HoverPreview::new(),
+            national_view: NationalView::new(),
+            minimap: Minimap::new(),
+            use_new_ui: true,
+
+            #[cfg(not(target_arch = "wasm32"))]
+            preload_engine: None,
+
             #[cfg(not(target_arch = "wasm32"))]
             runtime,
         };
+
+        // Initialize preload engine
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let preload = crate::preload::PreloadEngine::new(app.runtime.handle().clone());
+            app.preload_engine = Some(preload);
+        }
 
         // Auto-load latest data on startup
         app.fetch_latest();
         // Fetch weather alerts
         app.alert_fetcher.fetch_alerts();
+
+        // Start preloading active weather sites
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(ref engine) = app.preload_engine {
+                let alerts = app.alert_fetcher.get_alerts();
+                engine.preload_active_weather(&alerts);
+            }
+        }
+
+        // Apply theme
+        crate::ui::theme::NexViewTheme::dark().apply_to_egui(&cc.egui_ctx);
+
         app
     }
 
@@ -1912,6 +1965,8 @@ impl RadarApp {
                 } else if self.sounding_mode {
                     self.sounding_fetcher.fetch_sounding(lat, lon);
                     self.sounding_mode = false;
+                    self.sounding_texture = None; // Clear old texture, show spinner
+                    self.sounding_pending = true;
                 } else {
                     for site in sites::RADAR_SITES.iter() {
                         let (sx, sy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
@@ -2252,6 +2307,27 @@ impl eframe::App for RadarApp {
         }
         // Check for sounding results
         self.check_sounding_result(ctx);
+        // Sync preload cache → national view thumbnails
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref engine) = self.preload_engine {
+            let cache = engine.get_cache();
+            if let Ok(guard) = cache.read() {
+                for station_id in guard.stations_loaded() {
+                    if self.national_view.loaded_count() < 200 {
+                        if let Some(cached) = guard.get(&station_id) {
+                            if let Some(ref pixels) = cached.thumbnail_pixels {
+                                self.national_view.update_thumbnail(ctx, &station_id, pixels);
+                            }
+                        }
+                    }
+                }
+            }
+            // Periodically refresh alerts and re-trigger preload
+            if self.show_warnings && self.alert_fetcher.should_refresh() {
+                let alerts = self.alert_fetcher.get_alerts();
+                engine.preload_active_weather(&alerts);
+            }
+        }
         if self.pending_anim_prerender {
             self.pending_anim_prerender = false;
             self.pre_render_animation_textures(ctx);
@@ -2274,8 +2350,14 @@ impl eframe::App for RadarApp {
             self.cross_section_max_alt_km = res.max_altitude_km;
         }
 
-        ControlBar::show(self, ctx);
-        SidePanel::show(self, ctx);
+        if self.use_new_ui {
+            Toolbar::show(self, ctx);
+            TimelineBar::show(self, ctx);
+            CollapsibleSidebar::show(self, ctx);
+        } else {
+            ControlBar::show(self, ctx);
+            SidePanel::show(self, ctx);
+        }
 
         // Cross-section window (bottom panel)
         if self.cross_section_texture.is_some() {
@@ -2392,11 +2474,62 @@ impl eframe::App for RadarApp {
                     self.draw_measurement(ui, available_rect);
                 }
 
+                // Hover preview on radar sites
+                if self.use_new_ui {
+                    let cursor_pos = response.hover_pos();
+                    if let Some(site) = self.hover_preview.detect_hover(cursor_pos, &self.map_view, available_rect) {
+                        let site_id = site.id.to_string();
+                        let thumbnail = {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.preload_engine.as_ref().and_then(|e| {
+                                    let cache = e.get_cache();
+                                    let guard = cache.read().ok()?;
+                                    guard.get(&site_id).and_then(|c| c.thumbnail_pixels.clone())
+                                })
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            { None::<Vec<u8>> }
+                        };
+                        if let Some(pos) = cursor_pos {
+                            self.hover_preview.draw_preview(
+                                ctx, ui, site, pos,
+                                thumbnail.as_deref(),
+                                None,
+                            );
+                        }
+                    }
+
+                    // Minimap in corner when zoomed in
+                    if Minimap::should_show(self.map_view.zoom) {
+                        let loaded: Vec<String> = {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.preload_engine.as_ref()
+                                    .map(|e| {
+                                        let cache = e.get_cache();
+                                        cache.read().map(|g| g.stations_loaded()).unwrap_or_default()
+                                    })
+                                    .unwrap_or_default()
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            { Vec::new() }
+                        };
+                        if let Some((lat, lon)) = self.minimap.draw(
+                            ui, available_rect, &self.map_view,
+                            &self.selected_station, &loaded,
+                        ) {
+                            self.map_view.center_lat = lat;
+                            self.map_view.center_lon = lon;
+                        }
+                    }
+                }
+
                 self.handle_interaction(&response, available_rect);
             });
 
         // Sounding window
-        if self.sounding_texture.is_some() || self.sounding_fetcher.is_fetching() {
+        if self.sounding_texture.is_some() || self.sounding_pending {
             let mut open = true;
             egui::Window::new("Sounding - Skew-T/Log-P")
                 .open(&mut open)
@@ -2408,6 +2541,13 @@ impl eframe::App for RadarApp {
                             ui.add_space(40.0);
                             ui.spinner();
                             ui.label("Fetching sounding data...");
+                        });
+                    } else if !self.sounding_fetcher.is_fetching() && self.sounding_pending && self.sounding_texture.is_none() {
+                        // Fetch finished but no texture = parse failed
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.colored_label(egui::Color32::YELLOW, "No sounding data available for this location.");
+                            ui.label("Try clicking closer to a reporting station.");
                         });
                     } else if let Some(tex) = &self.sounding_texture {
                         let available = ui.available_size();
@@ -2423,6 +2563,7 @@ impl eframe::App for RadarApp {
                 });
             if !open {
                 self.sounding_texture = None;
+                self.sounding_pending = false;
             }
         }
 
@@ -2573,6 +2714,10 @@ impl RadarApp {
     }
 
     fn check_sounding_result(&mut self, ctx: &egui::Context) {
+        // Only check when we don't already have a texture and a fetch was started
+        if self.sounding_texture.is_some() {
+            return;
+        }
         if let Some(profile) = self.sounding_fetcher.profile() {
             // Clear the result so we don't re-render every frame
             *self.sounding_fetcher.result.lock().unwrap() = None;
@@ -2582,6 +2727,7 @@ impl RadarApp {
             self.sounding_texture = Some(ctx.load_texture(
                 "sounding", image, egui::TextureOptions::LINEAR,
             ));
+            self.sounding_pending = false;
             log::info!("Sounding loaded: CAPE={:.0} CIN={:.0} SRH={:.0}",
                 profile.cape, profile.cin, profile.srh_0_1);
         }
