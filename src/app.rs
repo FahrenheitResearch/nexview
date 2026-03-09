@@ -387,7 +387,7 @@ impl RadarApp {
 
             color_preset: crate::render::color_table::ColorTablePreset::Default,
 
-            gpu_rendering: gpu_renderer.is_some(),
+            gpu_rendering: false, // GPU path has readback overhead; CPU+Rayon is faster
             gpu_renderer,
             last_render_range_km: None,
             quad_render_range_km: [None; 4],
