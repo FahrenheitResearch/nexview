@@ -162,6 +162,10 @@ impl SidePanel {
                     app.estimate_storm_motion();
                 }
                 app.selected_product = *product;
+                // Snap elevation to a valid tilt for the new product
+                if let Some(idx) = app.find_sweep_for_product(*product) {
+                    app.selected_elevation = idx;
+                }
                 app.needs_render = true;
             }
         }
@@ -200,13 +204,19 @@ impl SidePanel {
     fn elevation_selector(app: &mut RadarApp, ui: &mut Ui) {
         ui.label("Elevation:");
         if let Some(ref file) = app.current_file {
-            for (i, sweep) in file.sweeps.iter().enumerate() {
-                let label = format!("{:.1}°", sweep.elevation_angle);
-                let selected = app.selected_elevation == i;
-                if ui.selectable_label(selected, &label).clicked() {
-                    app.selected_elevation = i;
-                    app.needs_render = true;
+            let valid_indices = app.valid_sweep_indices(app.selected_product);
+            for &i in &valid_indices {
+                if let Some(sweep) = file.sweeps.get(i) {
+                    let label = format!("{:.1}°", sweep.elevation_angle);
+                    let selected = app.selected_elevation == i;
+                    if ui.selectable_label(selected, &label).clicked() {
+                        app.selected_elevation = i;
+                        app.needs_render = true;
+                    }
                 }
+            }
+            if valid_indices.is_empty() {
+                ui.label("No tilts for this product");
             }
         } else {
             ui.label("No data loaded");

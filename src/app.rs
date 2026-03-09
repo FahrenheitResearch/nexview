@@ -1134,7 +1134,7 @@ impl RadarApp {
     }
 
     /// Check if a sweep contains the given product and matches super-res requirements.
-    fn sweep_matches(sweep: &crate::nexrad::Level2Sweep, product: RadarProduct, require_super_res: bool) -> bool {
+    pub fn sweep_matches(sweep: &crate::nexrad::Level2Sweep, product: RadarProduct, require_super_res: bool) -> bool {
         let has_product = sweep.radials.iter().any(|r| {
             r.moments.iter().any(|m| m.product == product)
         });
@@ -1147,6 +1147,21 @@ impl RadarApp {
         } else {
             true
         }
+    }
+
+    /// Returns the sweep indices that are valid for the given product.
+    /// For super-res products, only sweeps with 0.5° azimuth spacing are included.
+    pub fn valid_sweep_indices(&self, product: RadarProduct) -> Vec<usize> {
+        let file = match self.current_file.as_ref() {
+            Some(f) => f,
+            None => return vec![],
+        };
+        let base = product.base_product();
+        let require_super_res = product.is_super_res();
+        file.sweeps.iter().enumerate()
+            .filter(|(_, sweep)| Self::sweep_matches(sweep, base, require_super_res))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     fn check_downloads(&mut self, ctx: &egui::Context) {
@@ -2915,9 +2930,11 @@ impl eframe::App for RadarApp {
                             ui.add_space(40.0);
                             ui.spinner();
                             ui.label("Fetching sounding data...");
+                            ui.add_space(8.0);
+                            ui.label("(Trying multiple data sources — may take up to 30s)");
                         });
                     } else if !self.sounding_fetcher.is_fetching() && self.sounding_pending && self.sounding_texture.is_none() {
-                        // Fetch finished but no texture = parse failed
+                        // Fetch finished but no texture = parse/render failed
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.colored_label(egui::Color32::YELLOW, "No sounding data available for this location.");
@@ -3064,9 +3081,12 @@ impl eframe::App for RadarApp {
         // Only request continuous repaint when actually needed
         let any_secondary_fetching = self.secondary_radars.iter().any(|r| r.fetcher.is_fetching());
         if self.anim_playing || self.anim_loading || self.fetcher.is_fetching()
-            || self.sounding_fetcher.is_fetching() || any_secondary_fetching
+            || any_secondary_fetching
         {
             ctx.request_repaint();
+        } else if self.sounding_fetcher.is_fetching() {
+            // Sounding fetch only needs ~4fps for the spinner animation
+            ctx.request_repaint_after(Duration::from_millis(250));
         } else {
             // Otherwise repaint at a low rate for background updates
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -3179,21 +3199,27 @@ impl RadarApp {
         if let Some(profile) = self.sounding_fetcher.profile() {
             // Clear the result so we don't re-render every frame
             *self.sounding_fetcher.result.lock().unwrap() = None;
-            // Render Skew-T diagram
-            let pixels = crate::render::skewt::SkewTRenderer::render(&profile, 900, 700);
-            let image = egui::ColorImage::from_rgba_unmultiplied([900, 700], &pixels);
-            self.sounding_texture = Some(ctx.load_texture(
-                "sounding", image, egui::TextureOptions::LINEAR,
-            ));
-            self.sounding_pending = false;
-            log::info!("Sounding loaded: CAPE={:.0} CIN={:.0} SRH={:.0}",
-                profile.params.sb_cape, profile.params.sb_cin, profile.params.srh_01);
+            // Render Skew-T diagram — wrap in catch_unwind to prevent crash
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::render::skewt::SkewTRenderer::render(&profile, 900, 700)
+            })) {
+                Ok(pixels) => {
+                    let image = egui::ColorImage::from_rgba_unmultiplied([900, 700], &pixels);
+                    self.sounding_texture = Some(ctx.load_texture(
+                        "sounding", image, egui::TextureOptions::LINEAR,
+                    ));
+                    self.sounding_pending = false;
+                    log::info!("Sounding loaded: CAPE={:.0} CIN={:.0} SRH={:.0}",
+                        profile.params.sb_cape, profile.params.sb_cin, profile.params.srh_01);
+                }
+                Err(_) => {
+                    log::error!("Skew-T render panicked — showing error to user");
+                    self.sounding_pending = true; // keep window open to show error
+                }
+            }
         } else {
-            // Fetch completed but no data — stop the continuous repaint loop.
-            // The sounding window will show the "no data" message.
-            // Keep sounding_pending true so the window stays open, but
-            // we no longer need continuous repainting.
-            // (sounding_pending will be cleared when user closes the window)
+            // Fetch completed but no data — the sounding window will show the "no data" message.
+            // Keep sounding_pending true so the window stays open.
         }
     }
 }

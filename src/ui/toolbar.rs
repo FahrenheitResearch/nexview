@@ -170,6 +170,10 @@ impl Toolbar {
                     app.estimate_storm_motion();
                 }
                 app.selected_product = product;
+                // Snap elevation to a valid tilt for the new product
+                if let Some(idx) = app.find_sweep_for_product(product) {
+                    app.selected_elevation = idx;
+                }
                 app.mark_all_needs_render();
             }
 
@@ -187,6 +191,8 @@ impl Toolbar {
         text_primary: Color32,
         text_secondary: Color32,
     ) {
+        let valid_indices = app.valid_sweep_indices(app.selected_product);
+
         let angle_text = if let Some(ref file) = app.current_file {
             if let Some(sweep) = file.sweeps.get(app.selected_elevation) {
                 format!("{:.1}\u{00B0}", sweep.elevation_angle)
@@ -197,19 +203,21 @@ impl Toolbar {
             "--.-\u{00B0}".to_string()
         };
 
-        let max_elev = app.current_file
-            .as_ref()
-            .map(|f| f.sweeps.len().saturating_sub(1))
-            .unwrap_or(0);
+        // Find current position in the valid indices list
+        let current_pos = valid_indices.iter().position(|&i| i == app.selected_elevation);
+        let can_go_down = current_pos.map_or(false, |pos| pos > 0);
+        let can_go_up = current_pos.map_or(false, |pos| pos + 1 < valid_indices.len());
 
-        // Down arrow
+        // Down arrow (lower elevation = earlier in valid_indices)
         if ui.add_enabled(
-            app.selected_elevation > 0,
+            can_go_down,
             egui::Button::new(RichText::new("\u{25BC}").size(10.0))
                 .min_size(egui::vec2(18.0, 22.0)),
         ).clicked() {
-            app.selected_elevation = app.selected_elevation.saturating_sub(1);
-            app.needs_render = true;
+            if let Some(pos) = current_pos {
+                app.selected_elevation = valid_indices[pos - 1];
+                app.needs_render = true;
+            }
         }
 
         ui.label(
@@ -219,14 +227,16 @@ impl Toolbar {
                 .monospace(),
         );
 
-        // Up arrow
+        // Up arrow (higher elevation = later in valid_indices)
         if ui.add_enabled(
-            app.selected_elevation < max_elev,
+            can_go_up,
             egui::Button::new(RichText::new("\u{25B2}").size(10.0))
                 .min_size(egui::vec2(18.0, 22.0)),
         ).clicked() {
-            app.selected_elevation += 1;
-            app.needs_render = true;
+            if let Some(pos) = current_pos {
+                app.selected_elevation = valid_indices[pos + 1];
+                app.needs_render = true;
+            }
         }
     }
 

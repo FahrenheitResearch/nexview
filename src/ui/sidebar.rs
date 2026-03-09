@@ -432,6 +432,10 @@ impl CollapsibleSidebar {
                     app.estimate_storm_motion();
                 }
                 app.selected_product = *product;
+                // Snap elevation to a valid tilt for the new product
+                if let Some(idx) = app.find_sweep_for_product(*product) {
+                    app.selected_elevation = idx;
+                }
                 app.mark_all_needs_render();
             }
         }
@@ -439,16 +443,22 @@ impl CollapsibleSidebar {
         ui.add_space(4.0);
         ui.separator();
 
-        // Elevation selector
+        // Elevation selector — filter to only tilts valid for the current product
         ui.label("Elevation:");
         if let Some(ref file) = app.current_file {
-            for (i, sweep) in file.sweeps.iter().enumerate() {
-                let label = format!("{:.1}\u{b0}", sweep.elevation_angle);
-                let selected = app.selected_elevation == i;
-                if ui.selectable_label(selected, &label).clicked() {
-                    app.selected_elevation = i;
-                    app.needs_render = true;
+            let valid_indices = app.valid_sweep_indices(app.selected_product);
+            for &i in &valid_indices {
+                if let Some(sweep) = file.sweeps.get(i) {
+                    let label = format!("{:.1}\u{b0}", sweep.elevation_angle);
+                    let selected = app.selected_elevation == i;
+                    if ui.selectable_label(selected, &label).clicked() {
+                        app.selected_elevation = i;
+                        app.needs_render = true;
+                    }
                 }
+            }
+            if valid_indices.is_empty() {
+                ui.label("No tilts for this product");
             }
         } else {
             ui.label("No data loaded");
