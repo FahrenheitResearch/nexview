@@ -20,14 +20,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clone rustmaps geodata
         run: |
-          git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git ../rustmaps
+          git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git $GITHUB_WORKSPACE/../rustmaps
       - name: Build
         run: cargo build --release
       - name: Package
         run: |
           mkdir dist
           cp target/release/nexview.exe dist/
-          cp -r ../rustmaps/data dist/rustmaps_data
+          cp -r $GITHUB_WORKSPACE/../rustmaps/data dist/rustmaps_data
           cd dist && 7z a ../NexView-Windows-x64.zip nexview.exe rustmaps_data
       - uses: actions/upload-artifact@v4
         with:
@@ -43,7 +43,7 @@ jobs:
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Clone rustmaps geodata
-        run: git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git ../rustmaps
+        run: git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git $GITHUB_WORKSPACE/../rustmaps
       - name: Build
         run: cargo build --release --target x86_64-apple-darwin
       - name: Create App Bundle
@@ -51,7 +51,7 @@ jobs:
           mkdir -p "NexView.app/Contents/MacOS"
           mkdir -p "NexView.app/Contents/Resources"
           cp target/x86_64-apple-darwin/release/nexview "NexView.app/Contents/MacOS/"
-          cp -r ../rustmaps/data "NexView.app/Contents/Resources/rustmaps_data"
+          cp -r $GITHUB_WORKSPACE/../rustmaps/data "NexView.app/Contents/Resources/rustmaps_data"
           cat > "NexView.app/Contents/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -95,7 +95,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Clone rustmaps geodata
-        run: git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git ../rustmaps
+        run: git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git $GITHUB_WORKSPACE/../rustmaps
       - name: Build
         run: cargo build --release
       - name: Create App Bundle
@@ -103,7 +103,7 @@ jobs:
           mkdir -p "NexView.app/Contents/MacOS"
           mkdir -p "NexView.app/Contents/Resources"
           cp target/release/nexview "NexView.app/Contents/MacOS/"
-          cp -r ../rustmaps/data "NexView.app/Contents/Resources/rustmaps_data"
+          cp -r $GITHUB_WORKSPACE/../rustmaps/data "NexView.app/Contents/Resources/rustmaps_data"
           cat > "NexView.app/Contents/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -151,14 +151,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
       - name: Clone rustmaps geodata
-        run: git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git ../rustmaps
+        run: git clone --depth 1 https://github.com/FahrenheitResearch/rustmaps.git $GITHUB_WORKSPACE/../rustmaps
       - name: Build
         run: cargo build --release
       - name: Package
         run: |
           mkdir dist
           cp target/release/nexview dist/
-          cp -r ../rustmaps/data dist/rustmaps_data
+          cp -r $GITHUB_WORKSPACE/../rustmaps/data dist/rustmaps_data
           cd dist && tar czf ../NexView-Linux-x64.tar.gz nexview rustmaps_data
       - uses: actions/upload-artifact@v4
         with:
