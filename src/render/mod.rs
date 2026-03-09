@@ -5,6 +5,7 @@ pub mod gpu_radar;
 pub mod radar;
 pub mod map;
 pub mod overlays;
+pub mod geo_overlays;
 pub mod skewt;
 pub mod warnings;
 

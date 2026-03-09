@@ -147,9 +147,16 @@ pub struct RadarApp {
     pub tvs_detections: Vec<crate::nexrad::detection::TVSDetection>,
     pub show_detections: bool,
 
+    // Dual pane mode (side-by-side comparison)
+    pub dual_pane: bool,
+    pub dual_pane_product: RadarProduct,
+    pub dual_pane_texture: Option<egui::TextureHandle>,
+    pub dual_pane_range_km: Option<f64>,
+
     // Overlays
     pub show_range_rings: bool,
     pub show_azimuth_lines: bool,
+    pub show_cities: bool,
 
     // Storm motion (for SRV)
     pub storm_motion_dir: f32,
@@ -160,8 +167,16 @@ pub struct RadarApp {
     pub sounding_mode: bool,
     pub sounding_texture: Option<egui::TextureHandle>,
 
+    // Measurement tool
+    pub measure_mode: bool,
+    pub measure_start: Option<(f64, f64)>,
+    pub measure_end: Option<(f64, f64)>,
+
     // Performance stats
     pub perf: PerfStats,
+
+    // Help overlay
+    pub show_help: bool,
 
     // Runtime
     runtime: tokio::runtime::Runtime,
@@ -312,8 +327,14 @@ impl RadarApp {
             tvs_detections: Vec::new(),
             show_detections: true,
 
+            dual_pane: false,
+            dual_pane_product: RadarProduct::Velocity,
+            dual_pane_texture: None,
+            dual_pane_range_km: None,
+
             show_range_rings: true,
             show_azimuth_lines: false,
+            show_cities: true,
 
             storm_motion_dir: 240.0,
             storm_motion_speed: 30.0,
@@ -322,9 +343,15 @@ impl RadarApp {
             sounding_mode: false,
             sounding_texture: None,
 
+            measure_mode: false,
+            measure_start: None,
+            measure_end: None,
+
             settings: AppSettings::load(),
 
             perf: PerfStats::default(),
+
+            show_help: false,
 
             runtime,
         };
@@ -805,6 +832,22 @@ impl RadarApp {
         }
     }
 
+    /// Estimate storm motion from the current velocity data and update the
+    /// storm_motion_dir / storm_motion_speed fields.
+    pub fn estimate_storm_motion(&mut self) {
+        if let Some(ref file) = self.current_file {
+            let vel_idx = self.find_sweep_for_product(RadarProduct::Velocity);
+            if let Some(idx) = vel_idx {
+                if let Some(vel_sweep) = file.sweeps.get(idx) {
+                    let (dir, speed) =
+                        crate::nexrad::srv::SRVComputer::estimate_storm_motion(vel_sweep);
+                    self.storm_motion_dir = dir;
+                    self.storm_motion_speed = speed;
+                }
+            }
+        }
+    }
+
     /// Find the best sweep for a given product.
     /// NEXRAD splits products across different sweeps at the same elevation.
     pub fn find_sweep_for_product(&self, product: RadarProduct) -> Option<usize> {
@@ -1061,6 +1104,69 @@ impl RadarApp {
                 self.single_texture = None;
             }
         }
+        // Render dual pane product (right pane) if dual_pane is active
+        if self.dual_pane {
+            let dp = self.dual_pane_product;
+            let dp_derived_sweep;
+            let (dp_product, dp_sweep) = match dp {
+                RadarProduct::VIL => {
+                    dp_derived_sweep = crate::nexrad::derived::DerivedProducts::compute_vil(file);
+                    (RadarProduct::VIL, Some(&dp_derived_sweep))
+                }
+                RadarProduct::EchoTops => {
+                    dp_derived_sweep = crate::nexrad::derived::DerivedProducts::compute_echo_tops(file, 18.0);
+                    (RadarProduct::EchoTops, Some(&dp_derived_sweep))
+                }
+                RadarProduct::StormRelativeVelocity => {
+                    let vel_idx = self.find_sweep_for_product(RadarProduct::Velocity);
+                    if let Some(idx) = vel_idx {
+                        if let Some(vel_sweep) = file.sweeps.get(idx) {
+                            dp_derived_sweep = crate::nexrad::srv::SRVComputer::compute(
+                                vel_sweep, self.storm_motion_dir, self.storm_motion_speed,
+                            );
+                            (RadarProduct::StormRelativeVelocity, Some(&dp_derived_sweep))
+                        } else {
+                            (dp, None)
+                        }
+                    } else {
+                        (dp, None)
+                    }
+                }
+                _ => {
+                    let sweep_idx = self.find_sweep_for_product(dp)
+                        .unwrap_or(self.selected_elevation);
+                    (dp, file.sweeps.get(sweep_idx))
+                }
+            };
+
+            if let Some(sweep) = dp_sweep {
+                let color_table = crate::render::ColorTable::for_product_preset(dp_product, self.color_preset);
+                let rendered = if use_gpu {
+                    self.gpu_renderer.as_ref().unwrap()
+                        .render_sweep_gpu(sweep, dp_product, site, 1024, &color_table)
+                } else {
+                    RadarRenderer::render_sweep_with_table(sweep, dp_product, site, 1024, &color_table)
+                };
+                if let Some(rendered) = rendered {
+                    self.dual_pane_range_km = Some(rendered.range_km);
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [rendered.width as usize, rendered.height as usize],
+                        &rendered.pixels,
+                    );
+                    self.dual_pane_texture = Some(ctx.load_texture(
+                        "radar_dual_pane",
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                } else {
+                    self.dual_pane_texture = None;
+                    self.dual_pane_range_km = None;
+                }
+            } else {
+                self.dual_pane_texture = None;
+                self.dual_pane_range_km = None;
+            }
+        }
 
         let render_method = if use_gpu { "GPU" } else { "CPU" };
         self.perf.render_time = Some(render_start.elapsed());
@@ -1230,6 +1336,137 @@ impl RadarApp {
         }
     }
 
+
+    fn draw_dual_pane(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let half_w = rect.width() / 2.0;
+
+        let left_rect = egui::Rect::from_min_size(rect.min, egui::vec2(half_w, rect.height()));
+        let right_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + half_w, rect.top()),
+            egui::vec2(rect.width() - half_w, rect.height()),
+        );
+
+        // Ensure map tiles are loaded for the half-pane size
+        let screen_w = half_w as f64;
+        let screen_h = rect.height() as f64;
+        let visible = self.map_view.visible_tiles(screen_w, screen_h);
+        for key in &visible {
+            self.tile_manager.request_tile(*key);
+            if let Some(tile_data) = self.tile_manager.get_tile(key) {
+                self.tile_textures.entry(*key).or_insert_with(|| {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [tile_data.width as usize, tile_data.height as usize],
+                        &tile_data.pixels,
+                    );
+                    ui.ctx().load_texture(
+                        format!("tile_{}_{}_{}", key.z, key.x, key.y),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+            }
+        }
+        let prefetch = self.map_view.prefetch_tiles(screen_w, screen_h);
+        for key in &prefetch {
+            self.tile_manager.request_tile(*key);
+        }
+
+        // -- Left pane: selected_product --
+        self.draw_map_in_rect(ui, left_rect);
+        // Draw radar overlay (left = single_texture)
+        if let Some(tex) = &self.single_texture {
+            if let Some(radar_rect) = self.last_render_range_km.and_then(|r| self.get_radar_rect_for_range(left_rect, r)) {
+                let clipped = ui.painter_at(left_rect);
+                clipped.image(
+                    tex.id(),
+                    radar_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::from_white_alpha(220),
+                );
+            }
+        }
+        // Overlays on left pane
+        self.draw_overlays_in_rect(ui, left_rect);
+        // Label
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(left_rect.min, egui::vec2(80.0, 22.0)),
+            4.0,
+            egui::Color32::from_black_alpha(180),
+        );
+        ui.painter().text(
+            left_rect.min + egui::vec2(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            self.selected_product.short_name(),
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+
+        // -- Right pane: dual_pane_product --
+        self.draw_map_in_rect(ui, right_rect);
+        // Draw radar overlay (right = dual_pane_texture)
+        if let Some(tex) = &self.dual_pane_texture {
+            if let Some(radar_rect) = self.dual_pane_range_km.and_then(|r| self.get_radar_rect_for_range(right_rect, r)) {
+                let clipped = ui.painter_at(right_rect);
+                clipped.image(
+                    tex.id(),
+                    radar_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::from_white_alpha(220),
+                );
+            }
+        }
+        // Overlays on right pane
+        self.draw_overlays_in_rect(ui, right_rect);
+        // Label
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(right_rect.min, egui::vec2(80.0, 22.0)),
+            4.0,
+            egui::Color32::from_black_alpha(180),
+        );
+        ui.painter().text(
+            right_rect.min + egui::vec2(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            self.dual_pane_product.short_name(),
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+
+        // Divider line
+        ui.painter().line_segment(
+            [egui::pos2(left_rect.right(), rect.top()), egui::pos2(left_rect.right(), rect.bottom())],
+            egui::Stroke::new(1.5, egui::Color32::from_gray(80)),
+        );
+    }
+
+    fn draw_overlays_in_rect(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let site = match sites::find_site(&self.selected_station) {
+            Some(s) => s,
+            None => return,
+        };
+        let clipped = ui.painter_at(rect);
+
+        if self.show_range_rings {
+            crate::render::overlays::MapOverlays::draw_range_rings(
+                &clipped, site.lat, site.lon, &self.map_view, rect,
+            );
+        }
+        if self.show_azimuth_lines {
+            let max_range = self.last_render_range_km.unwrap_or(230.0);
+            crate::render::overlays::MapOverlays::draw_azimuth_lines(
+                &clipped, site.lat, site.lon, &self.map_view, rect, max_range,
+            );
+        }
+        crate::render::overlays::MapOverlays::draw_site_marker(
+            &clipped, site.lat, site.lon, &self.selected_station, &self.map_view, rect,
+        );
+        if self.show_warnings {
+            let alerts = self.alert_fetcher.get_alerts();
+            crate::render::warnings::WarningRenderer::draw_warnings(
+                &alerts, &clipped, &self.map_view, rect,
+            );
+        }
+    }
+
     fn draw_map_in_rect(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
@@ -1300,6 +1537,16 @@ impl RadarApp {
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         let products = RadarProduct::all_products();
+
+        let mut toggle_help = false;
+        let mut toggle_range_rings = false;
+        let mut toggle_detections = false;
+        let mut toggle_sounding = false;
+        let mut toggle_measure = false;
+        let mut fetch_latest = false;
+        let mut zoom_in = false;
+        let mut zoom_out = false;
+        let mut num_product: Option<usize> = None;
 
         ctx.input(|i| {
             // Up/Down arrows: tilt up/down
@@ -1372,7 +1619,97 @@ impl RadarApp {
                 self.current_file = Some(self.anim_frames[self.anim_index].clone());
                 self.needs_render = true;
             }
+
+            // M: toggle measure mode
+            if i.key_pressed(egui::Key::M) {
+                toggle_measure = true;
+            }
+
+            // H / F1: toggle help overlay
+            if i.key_pressed(egui::Key::H) || i.key_pressed(egui::Key::F1) {
+                toggle_help = true;
+            }
+
+            // R: toggle range rings
+            if i.key_pressed(egui::Key::R) {
+                toggle_range_rings = true;
+            }
+
+            // D: toggle meso/TVS detection
+            if i.key_pressed(egui::Key::D) {
+                toggle_detections = true;
+            }
+
+            // S: toggle sounding mode
+            if i.key_pressed(egui::Key::S) {
+                toggle_sounding = true;
+            }
+
+            // +/=: zoom in, -: zoom out
+            if i.key_pressed(egui::Key::Plus) {
+                zoom_in = true;
+            }
+            if i.key_pressed(egui::Key::Minus) {
+                zoom_out = true;
+            }
+
+            // L: load latest data
+            if i.key_pressed(egui::Key::L) {
+                fetch_latest = true;
+            }
+
+            // 1-9: select product directly
+            let num_keys = [
+                egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+                egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
+                egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+            ];
+            for (idx, key) in num_keys.iter().enumerate() {
+                if i.key_pressed(*key) {
+                    num_product = Some(idx);
+                }
+            }
         });
+
+        // Apply state changes outside ctx.input closure
+        if toggle_help {
+            self.show_help = !self.show_help;
+        }
+        if toggle_range_rings {
+            self.show_range_rings = !self.show_range_rings;
+        }
+        if toggle_detections {
+            self.show_detections = !self.show_detections;
+        }
+        if toggle_sounding {
+            self.sounding_mode = !self.sounding_mode;
+        }
+        if toggle_measure {
+            self.measure_mode = !self.measure_mode;
+            if self.measure_mode {
+                self.measure_start = None;
+                self.measure_end = None;
+            }
+        }
+        if zoom_in {
+            self.map_view.zoom = (self.map_view.zoom + 0.5).min(18.0);
+            self.needs_render = true;
+        }
+        if zoom_out {
+            self.map_view.zoom = (self.map_view.zoom - 0.5).max(2.0);
+            self.needs_render = true;
+        }
+        if fetch_latest {
+            self.fetch_latest();
+        }
+        // Number key product selection: 1=REF, 2=VEL, 3=SW, 4=ZDR, 5=CC, 6=KDP, 7=SRV
+        if let Some(idx) = num_product {
+            let products = RadarProduct::all_products();
+            if idx < products.len() {
+                self.selected_product = products[idx];
+                self.needs_render = true;
+            }
+        }
     }
 
     fn handle_interaction(&mut self, response: &egui::Response, rect: egui::Rect) {
@@ -1408,7 +1745,14 @@ impl RadarApp {
                 let click_y = (pos.y - rect.top()) as f64;
                 let (lat, lon) = self.map_view.pixel_to_lat_lon(click_x, click_y, screen_w, screen_h);
 
-                if self.cross_section_mode {
+                if self.measure_mode {
+                    if self.measure_start.is_none() {
+                        self.measure_start = Some((lat, lon));
+                    } else {
+                        self.measure_end = Some((lat, lon));
+                        self.measure_mode = false;
+                    }
+                } else if self.cross_section_mode {
                     if self.cross_section_start.is_none() {
                         self.cross_section_start = Some((lat, lon));
                     } else {
@@ -1416,6 +1760,9 @@ impl RadarApp {
                         self.cross_section_mode = false;
                         self.render_cross_section_image();
                     }
+                } else if self.sounding_mode {
+                    self.sounding_fetcher.fetch_sounding(lat, lon);
+                    self.sounding_mode = false;
                 } else {
                     for site in sites::RADAR_SITES.iter() {
                         let (sx, sy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
@@ -1601,6 +1948,126 @@ impl RadarApp {
             }
         }
     }
+
+    fn draw_measurement(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        // Show mode indicator when actively measuring (even before first click)
+        if self.measure_mode && self.measure_start.is_none() {
+            let yellow = egui::Color32::from_rgb(255, 255, 0);
+            ui.painter().text(
+                egui::pos2(rect.left() + 10.0, rect.top() + 10.0),
+                egui::Align2::LEFT_TOP,
+                "Measure: click start point",
+                egui::FontId::proportional(14.0),
+                yellow,
+            );
+            return;
+        }
+
+        let start = match self.measure_start {
+            Some(s) => s,
+            None => return,
+        };
+
+        let screen_w = rect.width() as f64;
+        let screen_h = rect.height() as f64;
+
+        let (sx, sy) = self.map_view.lat_lon_to_pixel(start.0, start.1, screen_w, screen_h);
+        let start_pos = egui::pos2(rect.left() + sx as f32, rect.top() + sy as f32);
+
+        // Use end point if set, otherwise use cursor position (live preview)
+        let end = self.measure_end.unwrap_or((self.cursor_lat, self.cursor_lon));
+        let (ex, ey) = self.map_view.lat_lon_to_pixel(end.0, end.1, screen_w, screen_h);
+        let end_pos = egui::pos2(rect.left() + ex as f32, rect.top() + ey as f32);
+
+        let yellow = egui::Color32::from_rgb(255, 255, 0);
+
+        // Draw start marker
+        ui.painter().circle_filled(start_pos, 5.0, yellow);
+
+        // Draw dashed line from start to end
+        let dx = end_pos.x - start_pos.x;
+        let dy = end_pos.y - start_pos.y;
+        let line_len = (dx * dx + dy * dy).sqrt();
+        let dash_len = 8.0_f32;
+        let gap_len = 5.0_f32;
+        let segment = dash_len + gap_len;
+
+        if line_len > 1.0 {
+            let nx = dx / line_len;
+            let ny = dy / line_len;
+            let mut t = 0.0_f32;
+            while t < line_len {
+                let t_end = (t + dash_len).min(line_len);
+                let p0 = egui::pos2(start_pos.x + nx * t, start_pos.y + ny * t);
+                let p1 = egui::pos2(start_pos.x + nx * t_end, start_pos.y + ny * t_end);
+                ui.painter().line_segment([p0, p1], egui::Stroke::new(2.5, yellow));
+                t += segment;
+            }
+        }
+
+        // Draw end marker
+        if self.measure_end.is_some() {
+            ui.painter().circle_filled(end_pos, 5.0, yellow);
+        }
+
+        // Haversine distance and bearing
+        let (dist_km, bearing) = haversine_distance_bearing(start.0, start.1, end.0, end.1);
+        let dist_mi = dist_km * 0.621371;
+
+        // Draw label at midpoint
+        let mid_pos = egui::pos2(
+            (start_pos.x + end_pos.x) / 2.0,
+            (start_pos.y + end_pos.y) / 2.0,
+        );
+
+        let label = format!("{:.1} km / {:.1} mi\n{:.0}\u{00B0} bearing", dist_km, dist_mi, bearing);
+
+        // Background rect for readability
+        let font = egui::FontId::proportional(13.0);
+        let galley = ui.painter().layout_no_wrap(label.clone(), font.clone(), yellow);
+        let text_rect = egui::Rect::from_min_size(
+            egui::pos2(mid_pos.x + 10.0, mid_pos.y - galley.size().y / 2.0),
+            galley.size(),
+        ).expand(4.0);
+        ui.painter().rect_filled(text_rect, 4.0, egui::Color32::from_black_alpha(180));
+        ui.painter().galley(
+            egui::pos2(mid_pos.x + 10.0, mid_pos.y - galley.size().y / 2.0),
+            galley,
+            yellow,
+        );
+
+        // Show mode indicator when measuring (waiting for second click)
+        if self.measure_mode {
+            ui.painter().text(
+                egui::pos2(rect.left() + 10.0, rect.top() + 10.0),
+                egui::Align2::LEFT_TOP,
+                "Measure: click end point",
+                egui::FontId::proportional(14.0),
+                yellow,
+            );
+        }
+    }
+}
+
+/// Haversine formula for distance (km) and initial bearing (degrees) between two lat/lon points.
+fn haversine_distance_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> (f64, f64) {
+    let r = 6371.0; // Earth radius in km
+    let lat1_r = lat1.to_radians();
+    let lat2_r = lat2.to_radians();
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1_r.cos() * lat2_r.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    let distance = r * c;
+
+    let y = dlon.sin() * lat2_r.cos();
+    let x = lat1_r.cos() * lat2_r.sin() - lat1_r.sin() * lat2_r.cos() * dlon.cos();
+    let bearing = y.atan2(x).to_degrees();
+    let bearing = (bearing + 360.0) % 360.0;
+
+    (distance, bearing)
 }
 
 impl eframe::App for RadarApp {
@@ -1750,6 +2217,8 @@ impl eframe::App for RadarApp {
                         self.tile_manager.request_tile(*key);
                     }
                     self.draw_quad_overlay(ui, available_rect);
+                } else if self.dual_pane {
+                    self.draw_dual_pane(ui, available_rect);
                 } else {
                     self.draw_map(ui, available_rect);
                     self.draw_radar_overlay(ui, available_rect);
@@ -1763,8 +2232,96 @@ impl eframe::App for RadarApp {
                     self.draw_cross_section_line(ui, available_rect);
                 }
 
+                // Draw measurement line/label
+                if self.measure_mode || self.measure_start.is_some() {
+                    self.draw_measurement(ui, available_rect);
+                }
+
                 self.handle_interaction(&response, available_rect);
             });
+
+        // Sounding window
+        if self.sounding_texture.is_some() || self.sounding_fetcher.is_fetching() {
+            let mut open = true;
+            egui::Window::new("Sounding - Skew-T/Log-P")
+                .open(&mut open)
+                .resizable(true)
+                .default_size([600.0, 800.0])
+                .show(ctx, |ui| {
+                    if self.sounding_fetcher.is_fetching() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.spinner();
+                            ui.label("Fetching sounding data...");
+                        });
+                    } else if let Some(tex) = &self.sounding_texture {
+                        let available = ui.available_size();
+                        let tex_aspect = tex.size()[0] as f32 / tex.size()[1] as f32;
+                        let (w, h) = if available.x / available.y > tex_aspect {
+                            (available.y * tex_aspect, available.y)
+                        } else {
+                            (available.x, available.x / tex_aspect)
+                        };
+                        let img_size = egui::vec2(w, h);
+                        ui.image(egui::load::SizedTexture::new(tex.id(), img_size));
+                    }
+                });
+            if !open {
+                self.sounding_texture = None;
+            }
+        }
+
+        // Help overlay window
+        if self.show_help {
+            let mut open = self.show_help;
+            egui::Window::new("Keyboard Shortcuts")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(420.0)
+                .show(ctx, |ui| {
+                    ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+
+                    let shortcuts: &[(&str, &str)] = &[
+                        ("H / F1",         "Toggle this help overlay"),
+                        ("Space",          "Play / pause animation"),
+                        ("Left / Right",   "Step animation frames"),
+                        (",  /  .",        "Step animation frames (alt)"),
+                        ("Up / Down",      "Change elevation angle"),
+                        ("1-7",            "Select product (1=REF 2=VEL 3=SW 4=ZDR 5=CC 6=KDP 7=SRV)"),
+                        ("Q",              "Toggle quad view"),
+                        ("R",              "Toggle range rings"),
+                        ("W",              "Toggle NWS warnings"),
+                        ("D",              "Toggle meso/TVS detection"),
+                        ("S",              "Toggle sounding mode"),
+                        ("M",              "Toggle measure mode"),
+                        ("L",              "Load latest data"),
+                        ("+ / -",          "Zoom in / out"),
+                        ("Scroll",         "Zoom at cursor"),
+                        ("Drag",           "Pan map"),
+                    ];
+
+                    egui::Grid::new("help_shortcuts_grid")
+                        .num_columns(2)
+                        .spacing([20.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (key, desc) in shortcuts {
+                                ui.strong(*key);
+                                ui.label(*desc);
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.weak("Press H or F1 to close");
+                });
+            if !open {
+                self.show_help = false;
+            }
+        }
 
         ctx.request_repaint();
     }
@@ -1796,6 +2353,13 @@ impl RadarApp {
         crate::render::overlays::MapOverlays::draw_site_marker(
             ui.painter(), site.lat, site.lon, &self.selected_station, &self.map_view, rect,
         );
+
+        // City labels
+        if self.show_cities {
+            crate::render::geo_overlays::GeoOverlays::draw_cities(
+                ui.painter(), &self.map_view, rect, self.map_view.zoom,
+            );
+        }
 
         // Weather warnings
         if self.show_warnings {

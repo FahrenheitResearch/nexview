@@ -27,6 +27,9 @@ impl SidePanel {
                         Self::product_selector(app, ui);
                         ui.separator();
 
+                        Self::storm_motion_controls(app, ui);
+                        ui.separator();
+
                         Self::elevation_selector(app, ui);
                         ui.separator();
 
@@ -159,6 +162,36 @@ impl SidePanel {
         }
     }
 
+    fn storm_motion_controls(app: &mut RadarApp, ui: &mut Ui) {
+        egui::CollapsingHeader::new("Storm Motion")
+            .default_open(false)
+            .show(ui, |ui| {
+                let is_srv = app.selected_product == RadarProduct::StormRelativeVelocity;
+
+                let dir_response = ui.add(
+                    egui::Slider::new(&mut app.storm_motion_dir, 0.0..=360.0)
+                        .text("Dir")
+                        .suffix("°"),
+                );
+                let spd_response = ui.add(
+                    egui::Slider::new(&mut app.storm_motion_speed, 0.0..=80.0)
+                        .text("Speed")
+                        .suffix(" kts"),
+                );
+
+                if is_srv && (dir_response.changed() || spd_response.changed()) {
+                    app.needs_render = true;
+                }
+
+                if ui.button("Auto-estimate").clicked() {
+                    app.estimate_storm_motion();
+                    if is_srv {
+                        app.needs_render = true;
+                    }
+                }
+            });
+    }
+
     fn elevation_selector(app: &mut RadarApp, ui: &mut Ui) {
         ui.label("Elevation:");
         if let Some(ref file) = app.current_file {
@@ -178,6 +211,27 @@ impl SidePanel {
     fn view_controls(app: &mut RadarApp, ui: &mut Ui) {
         ui.label("View:");
         ui.checkbox(&mut app.quad_view, "Quad View (4 products)");
+        if ui.checkbox(&mut app.dual_pane, "Dual Pane (side-by-side)").changed() {
+            if app.dual_pane {
+                app.quad_view = false; // mutually exclusive
+            }
+            app.needs_render = true;
+        }
+        if app.dual_pane {
+            ui.horizontal(|ui| {
+                ui.label("Right pane:");
+                egui::ComboBox::from_id_salt("dual_pane_product")
+                    .selected_text(app.dual_pane_product.display_name())
+                    .show_ui(ui, |ui| {
+                        for product in RadarProduct::all_products() {
+                            if ui.selectable_label(app.dual_pane_product == *product, product.display_name()).clicked() {
+                                app.dual_pane_product = *product;
+                                app.needs_render = true;
+                            }
+                        }
+                    });
+            });
+        }
 
         if ui.button(if app.wall_mode { "Exit Wall Mode" } else { "Wall Mode (20 radars)" }).clicked() {
             if app.wall_mode {
@@ -228,6 +282,7 @@ impl SidePanel {
         ui.label("Overlays:");
         ui.checkbox(&mut app.show_range_rings, "Range Rings");
         ui.checkbox(&mut app.show_azimuth_lines, "Azimuth Lines");
+        ui.checkbox(&mut app.show_cities, "City Labels");
         ui.checkbox(&mut app.show_warnings, "NWS Warnings");
         ui.checkbox(&mut app.show_detections, "Meso/TVS Detection");
 
@@ -235,6 +290,30 @@ impl SidePanel {
         if ui.checkbox(&mut app.sounding_mode, "Sounding Mode (click map)").changed() {
             if !app.sounding_mode {
                 app.sounding_texture = None;
+            }
+        }
+
+        ui.separator();
+        ui.label("Tools:");
+
+        let measure_label = if app.measure_mode {
+            if app.measure_start.is_none() {
+                "Measuring... (click start)"
+            } else {
+                "Measuring... (click end)"
+            }
+        } else {
+            "Measure Distance (M)"
+        };
+        if ui.button(measure_label).clicked() {
+            app.measure_mode = true;
+            app.measure_start = None;
+            app.measure_end = None;
+        }
+        if app.measure_start.is_some() && app.measure_end.is_some() {
+            if ui.button("Clear Measurement").clicked() {
+                app.measure_start = None;
+                app.measure_end = None;
             }
         }
 
