@@ -4,7 +4,7 @@ use chrono::{Datelike, NaiveDate};
 use crate::nexrad::{Level2File, RadarProduct, sites};
 use crate::render::{RadarRenderer, MapTileManager, GpuRadarRenderer};
 use crate::render::map::{MapView, TileProvider};
-use crate::data::NexradFetcher;
+use crate::data::{NexradFetcher, AlertFetcher, SoundingFetcher};
 use crate::ui::{SidePanel, ControlBar};
 
 const SETTINGS_PATH: &str = "nexview_settings.json";
@@ -138,6 +138,28 @@ pub struct RadarApp {
     pub last_render_range_km: Option<f64>,
     pub quad_render_range_km: [Option<f64>; 4],
 
+    // Weather alerts
+    pub alert_fetcher: AlertFetcher,
+    pub show_warnings: bool,
+
+    // Rotation detection
+    pub meso_detections: Vec<crate::nexrad::detection::MesocycloneDetection>,
+    pub tvs_detections: Vec<crate::nexrad::detection::TVSDetection>,
+    pub show_detections: bool,
+
+    // Overlays
+    pub show_range_rings: bool,
+    pub show_azimuth_lines: bool,
+
+    // Storm motion (for SRV)
+    pub storm_motion_dir: f32,
+    pub storm_motion_speed: f32,
+
+    // Sounding
+    pub sounding_fetcher: SoundingFetcher,
+    pub sounding_mode: bool,
+    pub sounding_texture: Option<egui::TextureHandle>,
+
     // Performance stats
     pub perf: PerfStats,
 
@@ -191,7 +213,7 @@ impl RadarApp {
         let settings = AppSettings::load();
 
         let fetcher = NexradFetcher::new(handle.clone());
-        let tile_manager = MapTileManager::new(handle);
+        let tile_manager = MapTileManager::new(handle.clone());
 
         // Try to initialize GPU compute renderer
         let gpu_renderer = cc.wgpu_render_state.as_ref().map(|rs| {
@@ -283,6 +305,23 @@ impl RadarApp {
             last_render_range_km: None,
             quad_render_range_km: [None; 4],
 
+            alert_fetcher: AlertFetcher::new(handle.clone()),
+            show_warnings: true,
+
+            meso_detections: Vec::new(),
+            tvs_detections: Vec::new(),
+            show_detections: true,
+
+            show_range_rings: true,
+            show_azimuth_lines: false,
+
+            storm_motion_dir: 240.0,
+            storm_motion_speed: 30.0,
+
+            sounding_fetcher: SoundingFetcher::new(handle.clone()),
+            sounding_mode: false,
+            sounding_texture: None,
+
             settings: AppSettings::load(),
 
             perf: PerfStats::default(),
@@ -292,6 +331,8 @@ impl RadarApp {
 
         // Auto-load latest data on startup
         app.fetch_latest();
+        // Fetch weather alerts
+        app.alert_fetcher.fetch_alerts();
         app
     }
 
@@ -819,6 +860,16 @@ impl RadarApp {
                     self.perf.total_radials = total_radials;
                     self.perf.total_gates = total_gates;
 
+                    // Run rotation detection on the new file
+                    if self.show_detections {
+                        if let Some(site) = sites::find_site(&self.selected_station) {
+                            let (mesos, tvs) = crate::nexrad::detection::RotationDetector::detect(&file, site);
+                            log::info!("Detection: {} mesocyclones, {} TVS", mesos.len(), tvs.len());
+                            self.meso_detections = mesos;
+                            self.tvs_detections = tvs;
+                        }
+                    }
+
                     self.current_file = Some(file);
                     self.selected_elevation = 0;
                     self.needs_render = true;
@@ -954,15 +1005,46 @@ impl RadarApp {
         }
 
         // Always render the selected single product too (for single view / overlay)
-        let sweep_idx = self.find_sweep_for_product(self.selected_product)
-            .unwrap_or(self.selected_elevation);
-        if let Some(sweep) = file.sweeps.get(sweep_idx) {
-            let color_table = crate::render::ColorTable::for_product_preset(self.selected_product, self.color_preset);
+        // Handle derived products that need special computation
+        let derived_sweep;
+        let (render_product, render_sweep) = match self.selected_product {
+            RadarProduct::VIL => {
+                derived_sweep = crate::nexrad::derived::DerivedProducts::compute_vil(file);
+                (RadarProduct::VIL, Some(&derived_sweep))
+            }
+            RadarProduct::EchoTops => {
+                derived_sweep = crate::nexrad::derived::DerivedProducts::compute_echo_tops(file, 18.0);
+                (RadarProduct::EchoTops, Some(&derived_sweep))
+            }
+            RadarProduct::StormRelativeVelocity => {
+                let vel_idx = self.find_sweep_for_product(RadarProduct::Velocity);
+                if let Some(idx) = vel_idx {
+                    if let Some(vel_sweep) = file.sweeps.get(idx) {
+                        derived_sweep = crate::nexrad::srv::SRVComputer::compute(
+                            vel_sweep, self.storm_motion_dir, self.storm_motion_speed,
+                        );
+                        (RadarProduct::StormRelativeVelocity, Some(&derived_sweep))
+                    } else {
+                        (self.selected_product, None)
+                    }
+                } else {
+                    (self.selected_product, None)
+                }
+            }
+            _ => {
+                let sweep_idx = self.find_sweep_for_product(self.selected_product)
+                    .unwrap_or(self.selected_elevation);
+                (self.selected_product, file.sweeps.get(sweep_idx))
+            }
+        };
+
+        if let Some(sweep) = render_sweep {
+            let color_table = crate::render::ColorTable::for_product_preset(render_product, self.color_preset);
             let rendered = if use_gpu {
                 self.gpu_renderer.as_ref().unwrap()
-                    .render_sweep_gpu(sweep, self.selected_product, site, 1024, &color_table)
+                    .render_sweep_gpu(sweep, render_product, site, 1024, &color_table)
             } else {
-                RadarRenderer::render_sweep(sweep, self.selected_product, site, 1024)
+                RadarRenderer::render_sweep_with_table(sweep, render_product, site, 1024, &color_table)
             };
             if let Some(rendered) = rendered {
                 self.last_render_range_km = Some(rendered.range_km);
@@ -1378,6 +1460,120 @@ impl RadarApp {
         }
     }
 
+    fn draw_cursor_readout(&self, ui: &mut egui::Ui, rect: egui::Rect, product: RadarProduct) {
+        // Need cursor position, radar data, and site info
+        let file = match &self.current_file {
+            Some(f) => f,
+            None => return,
+        };
+        let site = match sites::find_site(&self.selected_station) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Check if cursor is within the rect
+        let screen_w = rect.width() as f64;
+        let screen_h = rect.height() as f64;
+        let (cx, cy) = self.map_view.lat_lon_to_pixel(self.cursor_lat, self.cursor_lon, screen_w, screen_h);
+        let cursor_screen = egui::pos2(rect.left() + cx as f32, rect.top() + cy as f32);
+        if !rect.contains(cursor_screen) {
+            return;
+        }
+
+        // Find the sweep for this product
+        let sweep_idx = match self.find_sweep_for_product_in(file, product) {
+            Some(i) => i,
+            None => return,
+        };
+
+        // Look up the data
+        let readout = match crate::render::data_readout::lookup_cursor_data(
+            self.cursor_lat, self.cursor_lon,
+            site.lat, site.lon,
+            file, sweep_idx, product,
+        ) {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Format the readout lines
+        let value_str = crate::render::data_readout::format_value(readout.value, readout.product);
+        let lines = [
+            value_str,
+            format!("{:.1} km  {:.1}\u{00B0}", readout.range_km, readout.azimuth_deg),
+            format!("{:.2} km AGL", readout.height_agl_km),
+        ];
+
+        // Compute tooltip position (offset from cursor)
+        let offset = egui::vec2(16.0, -60.0);
+        let tooltip_pos = cursor_screen + offset;
+
+        // Measure text to size the background box
+        let font = egui::FontId::monospace(12.0);
+        let line_height = 16.0_f32;
+        let padding = 6.0_f32;
+
+        let max_width = lines.iter()
+            .map(|l| ui.painter().layout_no_wrap(l.clone(), font.clone(), egui::Color32::WHITE).rect.width())
+            .fold(0.0_f32, f32::max);
+
+        let box_width = max_width + padding * 2.0;
+        let box_height = lines.len() as f32 * line_height + padding * 2.0;
+
+        // Keep tooltip within bounds
+        let mut box_min = tooltip_pos;
+        if box_min.x + box_width > rect.right() {
+            box_min.x = cursor_screen.x - box_width - 8.0;
+        }
+        if box_min.y < rect.top() {
+            box_min.y = cursor_screen.y + 16.0;
+        }
+
+        let box_rect = egui::Rect::from_min_size(box_min, egui::vec2(box_width, box_height));
+
+        // Draw background
+        ui.painter().rect_filled(box_rect, 4.0, egui::Color32::from_black_alpha(200));
+        ui.painter().rect_stroke(box_rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Outside);
+
+        // Draw text lines
+        for (i, line) in lines.iter().enumerate() {
+            let text_pos = egui::pos2(
+                box_min.x + padding,
+                box_min.y + padding + i as f32 * line_height,
+            );
+            ui.painter().text(
+                text_pos,
+                egui::Align2::LEFT_TOP,
+                line,
+                font.clone(),
+                if i == 0 { egui::Color32::from_rgb(100, 255, 100) } else { egui::Color32::from_gray(220) },
+            );
+        }
+    }
+
+    /// Find the best sweep for a given product in a specific file (non-mutating helper).
+    fn find_sweep_for_product_in(&self, file: &Level2File, product: RadarProduct) -> Option<usize> {
+        // First, try the selected elevation
+        if let Some(sweep) = file.sweeps.get(self.selected_elevation) {
+            let has_product = sweep.radials.iter().any(|r| {
+                r.moments.iter().any(|m| m.product == product)
+            });
+            if has_product {
+                return Some(self.selected_elevation);
+            }
+        }
+        // Fallback to lowest elevation with this product
+        for (i, sweep) in file.sweeps.iter().enumerate() {
+            let has_product = sweep.radials.iter().any(|r| {
+                r.moments.iter().any(|m| m.product == product)
+            });
+            if has_product {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     fn draw_cross_section_line(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
@@ -1434,6 +1630,12 @@ impl eframe::App for RadarApp {
         }
         self.check_preload_downloads();
         self.check_wall_downloads(ctx);
+        // Refresh weather alerts every 60 seconds
+        if self.show_warnings && self.alert_fetcher.should_refresh() {
+            self.alert_fetcher.fetch_alerts();
+        }
+        // Check for sounding results
+        self.check_sounding_result(ctx);
         if self.pending_anim_prerender {
             self.pending_anim_prerender = false;
             self.pre_render_animation_textures(ctx);
@@ -1551,7 +1753,9 @@ impl eframe::App for RadarApp {
                 } else {
                     self.draw_map(ui, available_rect);
                     self.draw_radar_overlay(ui, available_rect);
+                    self.draw_overlays(ui, available_rect);
                     self.draw_radar_sites(ui, available_rect);
+                    self.draw_cursor_readout(ui, available_rect, self.selected_product);
                 }
 
                 // Draw cross-section line on map
@@ -1563,5 +1767,104 @@ impl eframe::App for RadarApp {
             });
 
         ctx.request_repaint();
+    }
+}
+
+impl RadarApp {
+    fn draw_overlays(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let site = match sites::find_site(&self.selected_station) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Range rings
+        if self.show_range_rings {
+            crate::render::overlays::MapOverlays::draw_range_rings(
+                ui.painter(), site.lat, site.lon, &self.map_view, rect,
+            );
+        }
+
+        // Azimuth lines
+        if self.show_azimuth_lines {
+            let max_range = self.last_render_range_km.unwrap_or(230.0);
+            crate::render::overlays::MapOverlays::draw_azimuth_lines(
+                ui.painter(), site.lat, site.lon, &self.map_view, rect, max_range,
+            );
+        }
+
+        // Site marker
+        crate::render::overlays::MapOverlays::draw_site_marker(
+            ui.painter(), site.lat, site.lon, &self.selected_station, &self.map_view, rect,
+        );
+
+        // Weather warnings
+        if self.show_warnings {
+            let alerts = self.alert_fetcher.get_alerts();
+            crate::render::warnings::WarningRenderer::draw_warnings(
+                &alerts, ui.painter(), &self.map_view, rect,
+            );
+        }
+
+        // Mesocyclone/TVS detections
+        if self.show_detections {
+            self.draw_detections(ui, rect);
+        }
+    }
+
+    fn draw_detections(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let screen_w = rect.width() as f64;
+        let screen_h = rect.height() as f64;
+
+        // Draw mesocyclone markers
+        for meso in &self.meso_detections {
+            let (px, py) = self.map_view.lat_lon_to_pixel(meso.lat, meso.lon, screen_w, screen_h);
+            let pos = egui::pos2(rect.left() + px as f32, rect.top() + py as f32);
+            if !rect.contains(pos) { continue; }
+
+            let (color, radius) = match meso.strength {
+                crate::nexrad::detection::RotationStrength::Weak =>
+                    (egui::Color32::YELLOW, 6.0),
+                crate::nexrad::detection::RotationStrength::Moderate =>
+                    (egui::Color32::from_rgb(255, 165, 0), 8.0),
+                crate::nexrad::detection::RotationStrength::Strong =>
+                    (egui::Color32::RED, 10.0),
+            };
+            ui.painter().circle_stroke(pos, radius, egui::Stroke::new(2.0, color));
+            ui.painter().circle_stroke(pos, radius - 3.0, egui::Stroke::new(1.0, color));
+        }
+
+        // Draw TVS markers (inverted triangle)
+        for tvs in &self.tvs_detections {
+            let (px, py) = self.map_view.lat_lon_to_pixel(tvs.lat, tvs.lon, screen_w, screen_h);
+            let pos = egui::pos2(rect.left() + px as f32, rect.top() + py as f32);
+            if !rect.contains(pos) { continue; }
+
+            let size = 10.0;
+            let color = egui::Color32::from_rgb(255, 0, 0);
+            // Inverted triangle
+            let points = vec![
+                egui::pos2(pos.x - size, pos.y - size),
+                egui::pos2(pos.x + size, pos.y - size),
+                egui::pos2(pos.x, pos.y + size),
+            ];
+            ui.painter().add(egui::Shape::convex_polygon(points, color.linear_multiply(0.3), egui::Stroke::new(2.5, color)));
+            ui.painter().text(pos + egui::vec2(12.0, -4.0), egui::Align2::LEFT_CENTER,
+                "TVS", egui::FontId::proportional(10.0), color);
+        }
+    }
+
+    fn check_sounding_result(&mut self, ctx: &egui::Context) {
+        if let Some(profile) = self.sounding_fetcher.profile() {
+            // Clear the result so we don't re-render every frame
+            *self.sounding_fetcher.result.lock().unwrap() = None;
+            // Render Skew-T diagram
+            let pixels = crate::render::skewt::SkewTRenderer::render(&profile, 600, 800);
+            let image = egui::ColorImage::from_rgba_unmultiplied([600, 800], &pixels);
+            self.sounding_texture = Some(ctx.load_texture(
+                "sounding", image, egui::TextureOptions::LINEAR,
+            ));
+            log::info!("Sounding loaded: CAPE={:.0} CIN={:.0} SRH={:.0}",
+                profile.cape, profile.cin, profile.srh_0_1);
+        }
     }
 }

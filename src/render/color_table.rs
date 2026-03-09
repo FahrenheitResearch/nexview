@@ -44,11 +44,13 @@ impl ColorTable {
     pub fn for_product(product: RadarProduct) -> Self {
         match product {
             RadarProduct::Reflectivity => Self::reflectivity_table(),
-            RadarProduct::Velocity => Self::velocity_table(),
+            RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => Self::velocity_table(),
             RadarProduct::SpectrumWidth => Self::spectrum_width_table(),
             RadarProduct::DifferentialReflectivity => Self::zdr_table(),
             RadarProduct::CorrelationCoefficient => Self::cc_table(),
             RadarProduct::SpecificDiffPhase => Self::kdp_table(),
+            RadarProduct::VIL => Self::vil_table(),
+            RadarProduct::EchoTops => Self::echo_tops_table(),
             _ => Self::reflectivity_table(),
         }
     }
@@ -225,6 +227,48 @@ impl ColorTable {
                 ColorEntry { value: 5.0, r: 255, g: 128, b: 0, a: 255 },
                 ColorEntry { value: 7.0, r: 255, g: 0, b: 0, a: 255 },
                 ColorEntry { value: 10.0, r: 200, g: 0, b: 200, a: 255 },
+            ],
+        }
+    }
+
+    fn vil_table() -> Self {
+        ColorTable {
+            name: "VIL".into(),
+            min_value: 0.0,
+            max_value: 80.0,
+            entries: vec![
+                ColorEntry { value: 0.0, r: 0, g: 0, b: 0, a: 0 },
+                ColorEntry { value: 1.0, r: 0, g: 130, b: 0, a: 200 },
+                ColorEntry { value: 5.0, r: 0, g: 200, b: 0, a: 255 },
+                ColorEntry { value: 10.0, r: 0, g: 255, b: 0, a: 255 },
+                ColorEntry { value: 15.0, r: 200, g: 255, b: 0, a: 255 },
+                ColorEntry { value: 25.0, r: 255, g: 255, b: 0, a: 255 },
+                ColorEntry { value: 30.0, r: 255, g: 200, b: 0, a: 255 },
+                ColorEntry { value: 40.0, r: 255, g: 128, b: 0, a: 255 },
+                ColorEntry { value: 50.0, r: 255, g: 0, b: 0, a: 255 },
+                ColorEntry { value: 60.0, r: 200, g: 0, b: 0, a: 255 },
+                ColorEntry { value: 70.0, r: 180, g: 0, b: 180, a: 255 },
+                ColorEntry { value: 80.0, r: 255, g: 0, b: 255, a: 255 },
+            ],
+        }
+    }
+
+    fn echo_tops_table() -> Self {
+        ColorTable {
+            name: "Echo Tops".into(),
+            min_value: 0.0,
+            max_value: 20.0,
+            entries: vec![
+                ColorEntry { value: 0.0, r: 0, g: 0, b: 0, a: 0 },
+                ColorEntry { value: 1.0, r: 0, g: 0, b: 180, a: 200 },
+                ColorEntry { value: 3.0, r: 0, g: 100, b: 255, a: 255 },
+                ColorEntry { value: 5.0, r: 0, g: 200, b: 255, a: 255 },
+                ColorEntry { value: 7.0, r: 0, g: 200, b: 0, a: 255 },
+                ColorEntry { value: 10.0, r: 0, g: 255, b: 0, a: 255 },
+                ColorEntry { value: 12.0, r: 255, g: 255, b: 0, a: 255 },
+                ColorEntry { value: 15.0, r: 255, g: 200, b: 0, a: 255 },
+                ColorEntry { value: 17.0, r: 255, g: 0, b: 0, a: 255 },
+                ColorEntry { value: 20.0, r: 200, g: 0, b: 0, a: 255 },
             ],
         }
     }

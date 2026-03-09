@@ -10,6 +10,9 @@ pub enum RadarProduct {
     DifferentialPhase,       // PHI / KDP
     SpecificDiffPhase,       // KDP
     HydrometeorClass,        // HHC
+    VIL,                         // Vertically Integrated Liquid (derived)
+    EchoTops,                    // Echo Tops (derived)
+    StormRelativeVelocity,       // SRV (computed from VEL + storm motion)
     Unknown,
 }
 
@@ -24,6 +27,9 @@ impl RadarProduct {
             "PHI" => RadarProduct::DifferentialPhase,
             "KDP" => RadarProduct::SpecificDiffPhase,
             "HHC" => RadarProduct::HydrometeorClass,
+            "VIL" => RadarProduct::VIL,
+            "ET" => RadarProduct::EchoTops,
+            "SRV" => RadarProduct::StormRelativeVelocity,
             _ => RadarProduct::Unknown,
         }
     }
@@ -38,6 +44,9 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase => "Diff. Phase (PHI)",
             RadarProduct::SpecificDiffPhase => "Specific Diff. Phase (KDP)",
             RadarProduct::HydrometeorClass => "Hydrometeor Class (HHC)",
+            RadarProduct::VIL => "Vert. Integrated Liquid (VIL)",
+            RadarProduct::EchoTops => "Echo Tops (ET)",
+            RadarProduct::StormRelativeVelocity => "Storm Rel. Velocity (SRV)",
             RadarProduct::Unknown => "Unknown",
         }
     }
@@ -52,6 +61,9 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase => "PHI",
             RadarProduct::SpecificDiffPhase => "KDP",
             RadarProduct::HydrometeorClass => "HHC",
+            RadarProduct::VIL => "VIL",
+            RadarProduct::EchoTops => "ET",
+            RadarProduct::StormRelativeVelocity => "SRV",
             RadarProduct::Unknown => "???",
         }
     }
@@ -66,6 +78,9 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase => "deg",
             RadarProduct::SpecificDiffPhase => "deg/km",
             RadarProduct::HydrometeorClass => "",
+            RadarProduct::VIL => "kg/m²",
+            RadarProduct::EchoTops => "km",
+            RadarProduct::StormRelativeVelocity => "kts",
             RadarProduct::Unknown => "",
         }
     }
@@ -78,6 +93,7 @@ impl RadarProduct {
             RadarProduct::DifferentialReflectivity,
             RadarProduct::CorrelationCoefficient,
             RadarProduct::SpecificDiffPhase,
+            RadarProduct::StormRelativeVelocity,
         ]
     }
 }

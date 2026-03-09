@@ -224,6 +224,20 @@ impl SidePanel {
             }
         }
 
+        ui.separator();
+        ui.label("Overlays:");
+        ui.checkbox(&mut app.show_range_rings, "Range Rings");
+        ui.checkbox(&mut app.show_azimuth_lines, "Azimuth Lines");
+        ui.checkbox(&mut app.show_warnings, "NWS Warnings");
+        ui.checkbox(&mut app.show_detections, "Meso/TVS Detection");
+
+        // Sounding mode
+        if ui.checkbox(&mut app.sounding_mode, "Sounding Mode (click map)").changed() {
+            if !app.sounding_mode {
+                app.sounding_texture = None;
+            }
+        }
+
         if ui.button("Save as Default").clicked() {
             app.save_as_default();
         }
