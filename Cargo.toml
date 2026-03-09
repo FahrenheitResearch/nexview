@@ -1,6 +1,6 @@
 [package]
 name = "nexview"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 description = "Open-source NEXRAD weather radar viewer written in Rust"
 
