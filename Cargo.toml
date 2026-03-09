@@ -44,8 +44,8 @@ gif = "0.13"
 # Misc
 anyhow = "1"
 
-# Local tile rendering (optional - only available when rustmaps is present locally)
-rustmaps = { path = "../rustmaps", optional = true }
+# Local tile rendering (optional)
+rustmaps = { git = "https://github.com/FahrenheitResearch/rustmaps.git", optional = true }
 
 [features]
 default = []

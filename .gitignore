@@ -1,4 +1,5 @@
 /target
+.cargo/config.toml
 nexview_settings.json
 test_*.png
 *.log
