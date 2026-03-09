@@ -57,9 +57,9 @@ jobs:
             <key>CFBundleIdentifier</key>
             <string>com.fahrenheitresearch.nexview</string>
             <key>CFBundleVersion</key>
-            <string>1.1.1</string>
+            <string>1.2.0</string>
             <key>CFBundleShortVersionString</key>
-            <string>1.1.1</string>
+            <string>1.2.0</string>
             <key>CFBundleExecutable</key>
             <string>nexview</string>
             <key>CFBundlePackageType</key>
@@ -106,9 +106,9 @@ jobs:
             <key>CFBundleIdentifier</key>
             <string>com.fahrenheitresearch.nexview</string>
             <key>CFBundleVersion</key>
-            <string>1.1.1</string>
+            <string>1.2.0</string>
             <key>CFBundleShortVersionString</key>
-            <string>1.1.1</string>
+            <string>1.2.0</string>
             <key>CFBundleExecutable</key>
             <string>nexview</string>
             <key>CFBundlePackageType</key>
@@ -163,27 +163,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body: |
-            ## NexView v1.1.1
+            ## NexView v1.2.0
 
-            ### Bug Fixes (19 fixes)
-            - **Fixed sounding mode freeze** - NaN data caused async task panic, leaving fetching flag stuck (infinite spinner + 100% CPU)
-            - **Fixed critical SRV (Storm Relative Velocity) computation** - was subtracting knots from m/s, off by ~1.94x
-            - **Fixed crash on volume scans without reflectivity data** - graceful handling instead of panic
-            - **Fixed GPU rendering** - now defaults to wgpu backend with GPU enabled by default
-            - **Fixed unbounded memory growth** - map tile cache (500 max) and site cache (20 max) with LRU eviction
-            - **Fixed potential deadlock** in map tile provider switching
-            - **Fixed cross-section clipping** values above color table max
-            - **Fixed color legend** using premultiplied alpha incorrectly
-            - **Fixed GIF export** frame delay rounding
-            - **Fixed velocity display units** for SRV product
-            - **Fixed wall mode crash** on missing fetcher
-            - **Fixed concurrent download race condition**
-            - **Fixed color table** producing wrong colors for extreme values
-            - **Fixed macOS Gatekeeper** "damaged app" error with ad-hoc code signing
-            - Various other stability improvements
+            ### New Features
+            - **Multi-radar support** - Shift+Click any radar station to load multiple radars simultaneously on the map. All radars render at their geographic positions. Cyan chips in toolbar show loaded secondaries with remove buttons.
+
+            ### Fixes
+            - **GPU rendering on macOS** - Fixed Metal compatibility by using Rgba8Uint storage texture format
+            - **NWS warning polygon alignment** - Fixed south/east offset caused by Mercator projection nonlinearity in radar image positioning
+            - **Warning polygons in quad mode** - Polygons now render in all quad panes
+            - **Dual/quad mutual exclusivity** - Can no longer have both modes active simultaneously
+            - 19 bug fixes from v1.1.1 (SRV computation, sounding freeze, memory leaks, etc.)
 
             ### macOS Users
-            If you still see a Gatekeeper warning, right-click the app and select "Open", or run:
+            If you see a Gatekeeper warning, right-click the app and select "Open", or run:
             ```
             xattr -cr /Applications/NexView.app
             ```
