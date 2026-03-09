@@ -8,10 +8,24 @@ fn get_rustmaps_renderer() -> &'static rustmaps::render::TileRenderer {
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-        let data_dir = exe_dir
-            .map(|d| d.join("rustmaps_data"))
-            .filter(|d| d.exists())
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Users\drew\rustmaps\data"));
+
+        // Search order:
+        // 1. Next to the executable (Windows/Linux)
+        // 2. ../Resources/rustmaps_data (macOS .app bundle: Contents/MacOS/../Resources/)
+        // 3. Current working directory
+        let candidates: Vec<std::path::PathBuf> = exe_dir.iter()
+            .flat_map(|dir| vec![
+                dir.join("rustmaps_data"),
+                dir.join("../Resources/rustmaps_data"),
+            ])
+            .chain(std::iter::once(std::path::PathBuf::from("rustmaps_data")))
+            .collect();
+
+        let data_dir = candidates.into_iter()
+            .find(|d| d.exists())
+            .expect("rustmaps_data directory not found — place it next to the executable");
+
+        log::info!("Loading rustmaps geodata from: {}", data_dir.display());
         rustmaps::load_renderer(&data_dir).expect("Failed to load rustmaps geodata")
     })
 }
