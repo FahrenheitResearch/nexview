@@ -28,6 +28,7 @@ pub struct Level2File {
 pub struct Level2Sweep {
     pub elevation_number: u8,
     pub elevation_angle: f32,
+    pub nyquist_velocity: Option<f32>, // m/s, from radial 'R' data block
     pub radials: Vec<RadialData>,
 }
 
@@ -36,6 +37,7 @@ pub struct RadialData {
     pub azimuth: f32,
     pub elevation: f32,
     pub azimuth_spacing: f32,
+    pub nyquist_velocity: Option<f32>, // m/s, from radial 'R' data block
     pub moments: Vec<MomentData>,
 }
 
@@ -111,8 +113,13 @@ impl Level2File {
                     let sweep = sweeps_map.entry(elev_num).or_insert_with(|| Level2Sweep {
                         elevation_number: elev_num,
                         elevation_angle: radial.elevation,
+                        nyquist_velocity: radial.nyquist_velocity,
                         radials: Vec::new(),
                     });
+                    // Update sweep Nyquist if a radial provides it
+                    if sweep.nyquist_velocity.is_none() && radial.nyquist_velocity.is_some() {
+                        sweep.nyquist_velocity = radial.nyquist_velocity;
+                    }
                     sweep.radials.push(radial);
                 }
                 Ok(None) => continue,
@@ -297,6 +304,7 @@ impl Level2File {
 
         // Parse each data block
         let mut moments = Vec::new();
+        let mut nyquist_velocity: Option<f32> = None;
 
         for ptr_offset in &block_pointers {
             let block_pos = msg31_start + *ptr_offset as usize;
@@ -312,6 +320,10 @@ impl Level2File {
                     moments.push(moment);
                 }
             }
+            // 'R' = radial data block (contains Nyquist velocity)
+            else if block_type == "R" {
+                nyquist_velocity = Self::parse_radial_block_nyquist(data, block_pos);
+            }
         }
 
         // Calculate next message position
@@ -325,6 +337,7 @@ impl Level2File {
             azimuth: msg31.azimuth_angle,
             elevation: msg31.elevation_angle,
             azimuth_spacing: if msg31.azimuth_resolution == 1 { 0.5 } else { 1.0 },
+            nyquist_velocity,
             moments,
         };
 
@@ -382,6 +395,24 @@ impl Level2File {
             _cut_sector_number: cut_sector_number,
             data_block_count,
         })
+    }
+
+    /// Parse a Radial Data ('R') block to extract the Nyquist velocity.
+    /// ICD 2620010H Table XVII-B: Radial Data block is at least 28 bytes.
+    /// Byte 0: 'R', Bytes 1-3: "RAD"
+    /// Bytes 16-17: Unambiguous range (km/10, u16)
+    /// Bytes 26-27: Nyquist velocity (m/s * 100, u16) — note: some docs say offset 28
+    fn parse_radial_block_nyquist(data: &[u8], offset: usize) -> Option<f32> {
+        // The 'R' block needs at least 28 bytes
+        if offset + 28 > data.len() {
+            return None;
+        }
+        // Nyquist velocity is at bytes 26-27 in the radial block (u16, scaled by 100)
+        let nyquist_raw = u16::from_be_bytes([data[offset + 26], data[offset + 27]]);
+        if nyquist_raw == 0 {
+            return None;
+        }
+        Some(nyquist_raw as f32 / 100.0)
     }
 
     fn parse_moment_block(data: &[u8], offset: usize) -> Result<MomentData> {

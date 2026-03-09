@@ -156,6 +156,11 @@ impl SidePanel {
         for product in RadarProduct::all_products() {
             let selected = app.selected_product == *product;
             if ui.selectable_label(selected, product.display_name()).clicked() {
+                if *product == RadarProduct::StormRelativeVelocity
+                    && app.selected_product != RadarProduct::StormRelativeVelocity
+                {
+                    app.estimate_storm_motion();
+                }
                 app.selected_product = *product;
                 app.needs_render = true;
             }

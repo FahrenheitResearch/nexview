@@ -1,34 +1,119 @@
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
-/// A single level in a sounding profile.
-#[derive(Debug, Clone)]
-pub struct SoundingLevel {
-    pub pressure_mb: f32,
-    pub height_m: f32,
-    pub temp_c: f32,
-    pub dewpoint_c: f32,
-    pub wind_dir: f32,
-    pub wind_speed_kts: f32,
+// Re-export from the new sounding module for backward compatibility.
+pub use crate::sounding::{SoundingProfile, SoundingLevel, SoundingParams};
+
+// ── Upper-air station database ──────────────────────────────────────
+
+/// A RAOB (radiosonde) station with its coordinates.
+struct RaobStation {
+    id: &'static str,
+    lat: f64,
+    lon: f64,
 }
 
-/// A complete sounding profile with computed severe weather indices.
-#[derive(Debug, Clone)]
-pub struct SoundingProfile {
-    pub levels: Vec<SoundingLevel>,
-    pub station: String,
-    pub valid_time: String,
-    // Computed indices
-    pub cape: f32,
-    pub cin: f32,
-    pub lcl_m: f32,
-    pub srh_0_1: f32,
-    pub srh_0_3: f32,
-    pub bulk_shear_0_6: f32,
-    pub sig_tornado: f32,
+/// US upper-air network stations (subset covering CONUS + key sites).
+/// These launch radiosondes at 00Z and 12Z daily.
+const RAOB_STATIONS: &[RaobStation] = &[
+    RaobStation { id: "KOUN", lat: 35.18, lon: -97.44 },
+    RaobStation { id: "KDDC", lat: 37.77, lon: -99.97 },
+    RaobStation { id: "KTOP", lat: 39.07, lon: -95.62 },
+    RaobStation { id: "KSGF", lat: 37.24, lon: -93.40 },
+    RaobStation { id: "KLZK", lat: 34.83, lon: -92.26 },
+    RaobStation { id: "KSHV", lat: 32.45, lon: -93.84 },
+    RaobStation { id: "KFWD", lat: 32.83, lon: -97.30 },
+    RaobStation { id: "KAMA", lat: 35.23, lon: -101.71 },
+    RaobStation { id: "KMAF", lat: 31.94, lon: -102.19 },
+    RaobStation { id: "KEPZ", lat: 31.87, lon: -106.70 },
+    RaobStation { id: "KABQ", lat: 35.04, lon: -106.62 },
+    RaobStation { id: "KDNR", lat: 39.77, lon: -104.88 },
+    RaobStation { id: "KGJT", lat: 39.12, lon: -108.53 },
+    RaobStation { id: "KRIW", lat: 43.06, lon: -108.48 },
+    RaobStation { id: "KUNR", lat: 44.07, lon: -103.21 },
+    RaobStation { id: "KBIS", lat: 46.77, lon: -100.75 },
+    RaobStation { id: "KABR", lat: 45.45, lon: -98.41 },
+    RaobStation { id: "KOAX", lat: 41.32, lon: -96.37 },
+    RaobStation { id: "KDVN", lat: 41.61, lon: -90.58 },
+    RaobStation { id: "KILX", lat: 40.15, lon: -89.34 },
+    RaobStation { id: "KGRB", lat: 44.48, lon: -88.13 },
+    RaobStation { id: "KMPX", lat: 44.85, lon: -93.57 },
+    RaobStation { id: "KINX", lat: 36.17, lon: -95.78 },
+    RaobStation { id: "KBMX", lat: 33.17, lon: -86.77 },
+    RaobStation { id: "KJAN", lat: 32.32, lon: -90.08 },
+    RaobStation { id: "KLIX", lat: 30.34, lon: -89.83 },
+    RaobStation { id: "KLCH", lat: 30.13, lon: -93.22 },
+    RaobStation { id: "KCRP", lat: 27.77, lon: -97.50 },
+    RaobStation { id: "KBRO", lat: 25.91, lon: -97.42 },
+    RaobStation { id: "KDRT", lat: 29.37, lon: -100.92 },
+    RaobStation { id: "KJAX", lat: 30.50, lon: -81.70 },
+    RaobStation { id: "KTBW", lat: 27.70, lon: -82.40 },
+    RaobStation { id: "KMFL", lat: 25.75, lon: -80.38 },
+    RaobStation { id: "KXMR", lat: 28.47, lon: -80.57 },
+    RaobStation { id: "KTLH", lat: 30.40, lon: -84.35 },
+    RaobStation { id: "KFFC", lat: 33.36, lon: -84.57 },
+    RaobStation { id: "KGSO", lat: 36.10, lon: -79.94 },
+    RaobStation { id: "KMHX", lat: 34.78, lon: -76.88 },
+    RaobStation { id: "KRNK", lat: 37.20, lon: -80.41 },
+    RaobStation { id: "KIAD", lat: 38.95, lon: -77.46 },
+    RaobStation { id: "KWAL", lat: 37.94, lon: -75.47 },
+    RaobStation { id: "KOKX", lat: 40.87, lon: -72.87 },
+    RaobStation { id: "KALB", lat: 42.75, lon: -73.80 },
+    RaobStation { id: "KBUF", lat: 42.93, lon: -78.73 },
+    RaobStation { id: "KPIT", lat: 40.53, lon: -80.23 },
+    RaobStation { id: "KDTX", lat: 42.70, lon: -83.47 },
+    RaobStation { id: "KAPX", lat: 44.91, lon: -84.72 },
+    RaobStation { id: "KCAR", lat: 46.87, lon: -68.02 },
+    RaobStation { id: "KCHH", lat: 42.05, lon: -70.02 },
+    RaobStation { id: "KGYX", lat: 43.89, lon: -70.26 },
+    RaobStation { id: "KBNA", lat: 36.25, lon: -86.57 },
+    RaobStation { id: "KILN", lat: 39.42, lon: -83.82 },
+    RaobStation { id: "KSLC", lat: 40.77, lon: -111.97 },
+    RaobStation { id: "KBOI", lat: 43.57, lon: -116.22 },
+    RaobStation { id: "KGGW", lat: 48.21, lon: -106.62 },
+    RaobStation { id: "KTFX", lat: 47.46, lon: -111.38 },
+    RaobStation { id: "KOTX", lat: 47.68, lon: -117.63 },
+    RaobStation { id: "KSLE", lat: 44.92, lon: -123.00 },
+    RaobStation { id: "KREV", lat: 39.57, lon: -119.80 },
+    RaobStation { id: "KVEF", lat: 36.05, lon: -115.18 },
+    RaobStation { id: "KFGZ", lat: 35.23, lon: -111.82 },
+    RaobStation { id: "KNKX", lat: 32.87, lon: -117.15 },
+    RaobStation { id: "KVBG", lat: 34.75, lon: -120.57 },
+    RaobStation { id: "KOAK", lat: 37.75, lon: -122.22 },
+    RaobStation { id: "KPAH", lat: 37.07, lon: -88.77 },
+    RaobStation { id: "KLBF", lat: 41.13, lon: -100.68 },
+];
+
+/// Find the nearest RAOB station to the given lat/lon.
+fn nearest_station(lat: f64, lon: f64) -> &'static str {
+    let mut best = RAOB_STATIONS[0].id;
+    let mut best_dist = f64::MAX;
+
+    for stn in RAOB_STATIONS {
+        let dlat = stn.lat - lat;
+        let dlon = (stn.lon - lon) * (lat.to_radians().cos());
+        let dist = dlat * dlat + dlon * dlon;
+        if dist < best_dist {
+            best_dist = dist;
+            best = stn.id;
+        }
+    }
+    best
 }
 
-/// Fetches and parses model soundings from the RUC/RAP sounding server.
+/// Get station lat/lon for a given station ID.
+fn station_coords(id: &str) -> (f64, f64) {
+    for stn in RAOB_STATIONS {
+        if stn.id == id {
+            return (stn.lat, stn.lon);
+        }
+    }
+    (0.0, 0.0)
+}
+
+// ── Fetcher ─────────────────────────────────────────────────────────
+
+/// Fetches and parses sounding data from multiple sources with fallback.
 pub struct SoundingFetcher {
     http: Arc<reqwest::Client>,
     runtime: Handle,
@@ -36,242 +121,227 @@ pub struct SoundingFetcher {
     pub fetching: Arc<Mutex<bool>>,
 }
 
-// ── Physical constants ──────────────────────────────────────────────
+impl SoundingFetcher {
+    pub fn new(runtime: Handle) -> Self {
+        let client = reqwest::Client::builder()
+            .user_agent("NexView/0.3 (github.com/FahrenheitResearch/nexview)")
+            .timeout(std::time::Duration::from_secs(15))
+            .danger_accept_invalid_certs(true) // Handle expired certs (rucsoundings)
+            .build()
+            .expect("Failed to build HTTP client for sounding fetcher");
 
-const LV: f64 = 2.501e6;   // Latent heat of vaporisation (J/kg)
-const RD: f64 = 287.04;    // Specific gas constant for dry air (J/(kg·K))
-const RV: f64 = 461.5;     // Specific gas constant for water vapour (J/(kg·K))
-const CP: f64 = 1004.0;    // Specific heat of dry air at const pressure (J/(kg·K))
-const G: f64 = 9.80665;    // Gravitational acceleration (m/s²)
-const GAMMA_D: f64 = G / CP; // Dry adiabatic lapse rate (K/m)
-
-// ── Thermodynamic helpers ───────────────────────────────────────────
-
-/// Saturation vapour pressure (hPa) via the Bolton (1980) formula.
-fn sat_vapor_pressure(temp_c: f64) -> f64 {
-    6.112 * ((17.67 * temp_c) / (temp_c + 243.5)).exp()
-}
-
-/// Saturation mixing ratio (kg/kg) given temperature (°C) and pressure (hPa).
-fn sat_mixing_ratio(temp_c: f64, pres_mb: f64) -> f64 {
-    let es = sat_vapor_pressure(temp_c);
-    0.622 * es / (pres_mb - es).max(0.1)
-}
-
-/// Virtual temperature (K) given temperature (°C) and mixing ratio (kg/kg).
-fn virtual_temp_k(temp_c: f64, w: f64) -> f64 {
-    (temp_c + 273.15) * (1.0 + 0.61 * w)
-}
-
-/// Moist adiabatic lapse rate (K/m) at given T (°C) and P (hPa).
-fn moist_lapse_rate(temp_c: f64, pres_mb: f64) -> f64 {
-    let t_k = temp_c + 273.15;
-    let ws = sat_mixing_ratio(temp_c, pres_mb);
-    let numer = 1.0 + LV * ws / (RD * t_k);
-    let denom = 1.0 + LV * LV * ws / (CP * RV * t_k * t_k);
-    GAMMA_D * numer / denom
-}
-
-/// Pressure at a given height using the hypsometric equation, iteratively.
-fn pressure_at_height(h_target: f64, levels: &[SoundingLevel]) -> f64 {
-    if levels.is_empty() {
-        return 1013.25;
-    }
-    for i in 0..levels.len() - 1 {
-        let h0 = levels[i].height_m as f64;
-        let h1 = levels[i + 1].height_m as f64;
-        if h_target >= h0 && h_target <= h1 {
-            let frac = (h_target - h0) / (h1 - h0).max(1.0);
-            let p0 = levels[i].pressure_mb as f64;
-            let p1 = levels[i + 1].pressure_mb as f64;
-            return p0 + frac * (p1 - p0);
+        Self {
+            http: Arc::new(client),
+            runtime,
+            result: Arc::new(Mutex::new(None)),
+            fetching: Arc::new(Mutex::new(false)),
         }
     }
-    levels.last().unwrap().pressure_mb as f64
+
+    /// Returns a reference to the latest fetched profile.
+    pub fn profile(&self) -> Option<SoundingProfile> {
+        self.result.lock().unwrap().clone()
+    }
+
+    /// Returns true if a fetch is currently in progress.
+    pub fn is_fetching(&self) -> bool {
+        *self.fetching.lock().unwrap()
+    }
+
+    /// Kick off an async fetch of a sounding at the given lat/lon.
+    ///
+    /// Tries multiple data sources in order:
+    /// 1. Iowa Environmental Mesonet (IEM) JSON API — observed soundings
+    /// 2. rucsoundings.noaa.gov GSD format — RAP model soundings
+    pub fn fetch_sounding(&self, lat: f64, lon: f64) {
+        // Prevent concurrent fetches.
+        {
+            let mut f = self.fetching.lock().unwrap();
+            if *f {
+                return;
+            }
+            *f = true;
+        }
+
+        let http = Arc::clone(&self.http);
+        let result = Arc::clone(&self.result);
+        let fetching = Arc::clone(&self.fetching);
+
+        self.runtime.spawn(async move {
+            log::info!("Fetching sounding for ({lat:.2}, {lon:.2})");
+
+            // Fetch and parse sounding data. If anything panics, we still
+            // clear the `fetching` flag so the UI doesn't get stuck.
+            let profile = fetch_sounding_inner(&http, lat, lon).await;
+
+            if profile.is_none() {
+                log::error!("All sounding sources failed for ({lat:.2}, {lon:.2})");
+            }
+
+            // Always clear state — even if profile is None.
+            *result.lock().unwrap() = profile;
+            *fetching.lock().unwrap() = false;
+        });
+    }
 }
 
-/// Linearly interpolate a value at a given height from the profile.
-fn interp_at_height(h: f64, levels: &[SoundingLevel], get: fn(&SoundingLevel) -> f64) -> f64 {
-    if levels.is_empty() {
-        return 0.0;
+/// Actual sounding fetch logic, separated so the caller can guarantee
+/// cleanup (resetting the `fetching` flag) even if this function panics.
+async fn fetch_sounding_inner(
+    http: &reqwest::Client,
+    lat: f64,
+    lon: f64,
+) -> Option<SoundingProfile> {
+    let station = nearest_station(lat, lon);
+    let (stn_lat, stn_lon) = station_coords(station);
+
+    // Try latest 00Z and 12Z
+    let now = chrono::Utc::now();
+    let today = now.format("%Y%m%d").to_string();
+    let yesterday = (now - chrono::Duration::hours(24)).format("%Y%m%d").to_string();
+
+    // Build candidate timestamps: try recent synoptic times
+    let hour = now.hour();
+    let mut timestamps = Vec::new();
+    if hour >= 12 {
+        timestamps.push(format!("{today}1200"));
+        timestamps.push(format!("{today}0000"));
+    } else {
+        timestamps.push(format!("{today}0000"));
+        timestamps.push(format!("{yesterday}1200"));
     }
-    if h <= levels[0].height_m as f64 {
-        return get(&levels[0]);
-    }
-    for i in 0..levels.len() - 1 {
-        let h0 = levels[i].height_m as f64;
-        let h1 = levels[i + 1].height_m as f64;
-        if h >= h0 && h <= h1 {
-            let frac = (h - h0) / (h1 - h0).max(1.0);
-            return get(&levels[i]) + frac * (get(&levels[i + 1]) - get(&levels[i]));
+    timestamps.push(format!("{yesterday}0000"));
+
+    // ── Source 1: IEM JSON API (observed soundings) ──────────
+    for ts in &timestamps {
+        let url = format!(
+            "https://mesonet.agron.iastate.edu/json/raob.py?station={station}&ts={ts}"
+        );
+        log::info!("Trying IEM: {url}");
+
+        match http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.text().await {
+                    Ok(body) => {
+                        if let Some(p) = parse_iem_json(&body, stn_lat, stn_lon) {
+                            log::info!("IEM sounding parsed: {} levels from {station} at {ts}",
+                                p.levels.len());
+                            return Some(p);
+                        } else {
+                            log::warn!("IEM parse failed for {station} at {ts}");
+                        }
+                    }
+                    Err(e) => log::warn!("IEM body read error: {e}"),
+                }
+            }
+            Ok(resp) => log::warn!("IEM returned status {}", resp.status()),
+            Err(e) => log::warn!("IEM fetch error: {e}"),
         }
     }
-    get(levels.last().unwrap())
+
+    // ── Source 2: rucsoundings.noaa.gov (RAP model) ─────────
+    let url = format!(
+        "https://rucsoundings.noaa.gov/get_soundings.cgi?\
+         data_source=Op40&latest=latest&start_sounding=latest&\
+         n_hrs=1.0&fcst_len=shortest&airport={lat}%2C{lon}&\
+         text=Ascii%20text%20%28GSD%20format%29"
+    );
+    log::info!("Trying rucsoundings: {url}");
+
+    match http.get(&url).send().await {
+        Ok(resp) => match resp.text().await {
+            Ok(body) => {
+                if let Some(p) = parse_gsd(&body, lat, lon) {
+                    log::info!("GSD sounding parsed: {} levels", p.levels.len());
+                    return Some(p);
+                } else {
+                    log::warn!("Failed to parse GSD response");
+                }
+            }
+            Err(e) => log::warn!("GSD body read error: {e}"),
+        },
+        Err(e) => log::warn!("GSD fetch error: {e}"),
+    }
+
+    None
 }
 
-/// Wind components (u, v) in knots from direction (degrees) and speed.
-fn wind_components(wdir: f64, wspd: f64) -> (f64, f64) {
-    let rad = wdir.to_radians();
-    let u = -wspd * rad.sin();
-    let v = -wspd * rad.cos();
-    (u, v)
-}
+use chrono::Timelike;
 
-// ── Index computation ───────────────────────────────────────────────
+// ── IEM JSON parser ─────────────────────────────────────────────────
 
-fn compute_indices(levels: &[SoundingLevel]) -> (f32, f32, f32, f32, f32, f32, f32) {
+/// Parse the IEM JSON sounding format.
+///
+/// Expected format:
+/// ```json
+/// {
+///   "profiles": [{
+///     "station": "KOUN",
+///     "valid": "2026-03-09T00:00:00Z",
+///     "profile": [
+///       {"pres": 972.0, "hght": 357.0, "tmpc": 22.4, "dwpc": 2.4, "drct": 170.0, "sknt": 7.0},
+///       ...
+///     ]
+///   }]
+/// }
+/// ```
+fn parse_iem_json(body: &str, lat: f64, lon: f64) -> Option<SoundingProfile> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+
+    let profiles = json.get("profiles")?.as_array()?;
+    if profiles.is_empty() {
+        return None;
+    }
+
+    let first = &profiles[0];
+    let station = first.get("station")?.as_str().unwrap_or("UNKNOWN").to_string();
+    let valid_time = first.get("valid")?.as_str().unwrap_or("").to_string();
+    let profile_arr = first.get("profile")?.as_array()?;
+
+    let mut levels: Vec<SoundingLevel> = Vec::new();
+
+    for entry in profile_arr {
+        let pres = entry.get("pres").and_then(|v| v.as_f64());
+        let hght = entry.get("hght").and_then(|v| v.as_f64());
+        let tmpc = entry.get("tmpc").and_then(|v| v.as_f64());
+        let dwpc = entry.get("dwpc").and_then(|v| v.as_f64());
+        let drct = entry.get("drct").and_then(|v| v.as_f64());
+        let sknt = entry.get("sknt").and_then(|v| v.as_f64());
+
+        // Skip levels with missing essential data
+        if let (Some(p), Some(h), Some(t), Some(td)) = (pres, hght, tmpc, dwpc) {
+            if p > 0.0 && p < 1100.0 && h > -1000.0 {
+                levels.push(SoundingLevel {
+                    pressure_mb: p as f32,
+                    height_m: h as f32,
+                    temp_c: t as f32,
+                    dewpoint_c: td as f32,
+                    wind_dir: drct.unwrap_or(0.0) as f32,
+                    wind_speed_kts: sknt.unwrap_or(0.0) as f32,
+                });
+            }
+        }
+    }
+
     if levels.len() < 3 {
-        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        log::warn!("IEM parse: insufficient levels ({})", levels.len());
+        return None;
     }
 
-    let sfc = &levels[0];
-    let sfc_h = sfc.height_m as f64;
-    let sfc_t = sfc.temp_c as f64;
-    let sfc_td = sfc.dewpoint_c as f64;
+    // Filter out any NaN/Inf values that could cause panics downstream.
+    levels.retain(|l| l.pressure_mb.is_finite() && l.height_m.is_finite()
+        && l.temp_c.is_finite() && l.dewpoint_c.is_finite());
 
-    // ── LCL ─────────────────────────────────────────────────────────
-    // Lift dry-adiabatically until temp reaches dewpoint (iterative).
-    let mut parcel_t = sfc_t;
-    let mut parcel_td = sfc_td;
-    let mut lcl_h = sfc_h;
-    let dz = 10.0; // 10 m steps
-    loop {
-        if parcel_t <= parcel_td || lcl_h > 20_000.0 + sfc_h {
-            break;
-        }
-        parcel_t -= GAMMA_D * dz;
-        // Dewpoint decreases ~0.0018°C/m during dry ascent (mixing ratio conserved approximation).
-        parcel_td -= 0.0018 * dz;
-        lcl_h += dz;
-    }
-    let lcl_m_agl = lcl_h - sfc_h;
-
-    // ── Parcel ascent above LCL (moist adiabat) + CAPE/CIN ─────────
-    let max_h = levels.last().unwrap().height_m as f64;
-    let mut cape: f64 = 0.0;
-    let mut cin: f64 = 0.0;
-    let mut h = sfc_h;
-    let mut p_t = sfc_t; // parcel temperature during ascent
-
-    while h < max_h {
-        let pres = pressure_at_height(h, levels);
-        let env_t = interp_at_height(h, levels, |l| l.temp_c as f64);
-        let env_td = interp_at_height(h, levels, |l| l.dewpoint_c as f64);
-
-        // Parcel virtual temperature
-        let p_ws = if h >= lcl_h {
-            sat_mixing_ratio(p_t, pres)
-        } else {
-            sat_mixing_ratio(sfc_td, pres) // conserve mixing ratio below LCL
-        };
-        let tv_parcel = virtual_temp_k(p_t, p_ws);
-
-        // Environment virtual temperature
-        let env_ws = sat_mixing_ratio(env_td, pres);
-        let tv_env = virtual_temp_k(env_t, env_ws);
-
-        let buoy = G * (tv_parcel - tv_env) / tv_env * dz;
-
-        if tv_parcel > tv_env {
-            cape += buoy;
-        } else if h < lcl_h + 3000.0 {
-            // CIN only counted below ~3 km above LCL
-            cin += buoy; // buoy is negative here
-        }
-
-        // Step parcel temperature
-        if h < lcl_h {
-            p_t -= GAMMA_D * dz;
-        } else {
-            let gamma_m = moist_lapse_rate(p_t, pres);
-            p_t -= gamma_m * dz;
-        }
-
-        h += dz;
+    if levels.len() < 3 {
+        log::warn!("IEM parse: insufficient finite levels after filtering");
+        return None;
     }
 
-    let cape = cape.max(0.0) as f32;
-    let cin = cin.min(0.0) as f32;
-    let lcl_m = lcl_m_agl as f32;
+    // Sort by decreasing pressure (surface first, top last).
+    levels.sort_by(|a, b| b.pressure_mb.partial_cmp(&a.pressure_mb)
+        .unwrap_or(std::cmp::Ordering::Equal));
 
-    // ── Bulk wind shear 0-6 km ──────────────────────────────────────
-    let h6 = sfc_h + 6000.0;
-    let u_sfc;
-    let v_sfc;
-    {
-        let wd = interp_at_height(sfc_h, levels, |l| l.wind_dir as f64);
-        let ws = interp_at_height(sfc_h, levels, |l| l.wind_speed_kts as f64);
-        let (u, v) = wind_components(wd, ws);
-        u_sfc = u;
-        v_sfc = v;
-    }
-    let u_6k;
-    let v_6k;
-    {
-        let wd = interp_at_height(h6, levels, |l| l.wind_dir as f64);
-        let ws = interp_at_height(h6, levels, |l| l.wind_speed_kts as f64);
-        let (u, v) = wind_components(wd, ws);
-        u_6k = u;
-        v_6k = v;
-    }
-    let bulk_shear_0_6 = ((u_6k - u_sfc).powi(2) + (v_6k - v_sfc).powi(2)).sqrt() as f32;
-
-    // ── Bunkers right-mover storm motion ────────────────────────────
-    // Mean wind 0-6 km and deviation.
-    let n_steps = 60; // every 100 m from 0 to 6 km
-    let mut u_mean = 0.0;
-    let mut v_mean = 0.0;
-    for i in 0..=n_steps {
-        let hh = sfc_h + (i as f64 / n_steps as f64) * 6000.0;
-        let wd = interp_at_height(hh, levels, |l| l.wind_dir as f64);
-        let ws = interp_at_height(hh, levels, |l| l.wind_speed_kts as f64);
-        let (u, v) = wind_components(wd, ws);
-        u_mean += u;
-        v_mean += v;
-    }
-    u_mean /= (n_steps + 1) as f64;
-    v_mean /= (n_steps + 1) as f64;
-
-    // Shear vector 0-6km
-    let du = u_6k - u_sfc;
-    let dv = v_6k - v_sfc;
-    let shear_mag = (du * du + dv * dv).sqrt().max(0.001);
-    // Deviation magnitude = 7.5 m/s ≈ 14.6 kt
-    let d = 7.5 * 1.944; // convert m/s to knots
-    let u_storm = u_mean + d * dv / shear_mag;
-    let v_storm = v_mean - d * du / shear_mag;
-
-    // ── SRH calculation ─────────────────────────────────────────────
-    let compute_srh = |depth_m: f64| -> f64 {
-        let mut srh = 0.0;
-        let step = 100.0;
-        let mut prev_u = u_sfc;
-        let mut prev_v = v_sfc;
-        let mut hh = sfc_h + step;
-        while hh <= sfc_h + depth_m {
-            let wd = interp_at_height(hh, levels, |l| l.wind_dir as f64);
-            let ws = interp_at_height(hh, levels, |l| l.wind_speed_kts as f64);
-            let (u, v) = wind_components(wd, ws);
-            srh += (u - prev_u) * (v - v_storm) - (v - prev_v) * (u - u_storm);
-            prev_u = u;
-            prev_v = v;
-            hh += step;
-        }
-        srh
-    };
-
-    let srh_0_1 = compute_srh(1000.0) as f32;
-    let srh_0_3 = compute_srh(3000.0) as f32;
-
-    // ── Significant Tornado Parameter ───────────────────────────────
-    let lcl_term = ((2000.0 - lcl_m_agl) / 1000.0).clamp(0.0, 1.0);
-    let stp = ((cape as f64) / 1500.0)
-        * ((srh_0_1 as f64) / 150.0)
-        * ((bulk_shear_0_6 as f64) / 20.0)
-        * lcl_term;
-    let sig_tornado = stp.max(0.0) as f32;
-
-    (cape, cin, lcl_m, srh_0_1, srh_0_3, bulk_shear_0_6, sig_tornado)
+    Some(SoundingProfile::new(levels, station, valid_time, lat, lon))
 }
 
 // ── GSD format parser ───────────────────────────────────────────────
@@ -282,8 +352,8 @@ fn compute_indices(levels: &[SoundingLevel]) -> (f32, f32, f32, f32, f32, f32, f
 /// data lines. Data lines contain 7 whitespace-separated numeric columns:
 ///   TYPE  PRESSURE  HEIGHT  TEMP  DEWPT  WDIR  WSPD
 /// where TYPE is an integer code (e.g. 4=mandatory, 5=significant, etc.).
-/// Temperatures are in tenths of °C, winds in knots.
-fn parse_gsd(body: &str) -> Option<SoundingProfile> {
+/// Temperatures are in tenths of C, winds in knots.
+fn parse_gsd(body: &str, lat: f64, lon: f64) -> Option<SoundingProfile> {
     let mut station = String::new();
     let mut valid_time = String::new();
     let mut levels: Vec<SoundingLevel> = Vec::new();
@@ -296,14 +366,13 @@ fn parse_gsd(body: &str) -> Option<SoundingProfile> {
 
         // Station header line (type 1): contains station id
         if line.starts_with("1") && station.is_empty() {
-            // Try to extract station from fields
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 3 {
                 station = parts.get(2).unwrap_or(&"UNKNOWN").to_string();
             }
         }
 
-        // Check for valid time info (type 2 or 3 header)
+        // Check for valid time info (type 2 header)
         if line.starts_with("2") && valid_time.is_empty() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
@@ -312,12 +381,10 @@ fn parse_gsd(body: &str) -> Option<SoundingProfile> {
         }
 
         // Data lines: first field is type code (4,5,6,7,8,9), remaining are data.
-        // We accept types 4-9 as valid data lines.
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 7 {
             if let Ok(type_code) = parts[0].parse::<i32>() {
                 if (4..=9).contains(&type_code) {
-                    // Parse columns: TYPE PRES HGHT TEMP DWPT WDIR WSPD
                     let pres: f32 = parts[1].parse().unwrap_or(-9999.0);
                     let hght: f32 = parts[2].parse().unwrap_or(-9999.0);
                     let temp_raw: f32 = parts[3].parse().unwrap_or(-9999.0);
@@ -325,11 +392,11 @@ fn parse_gsd(body: &str) -> Option<SoundingProfile> {
                     let wdir: f32 = parts[5].parse().unwrap_or(-9999.0);
                     let wspd: f32 = parts[6].parse().unwrap_or(-9999.0);
 
-                    // GSD format: temps in tenths of °C
+                    // GSD format: temps in tenths of C
                     let temp_c = temp_raw / 10.0;
                     let dewpt_c = dwpt_raw / 10.0;
 
-                    // Skip levels with missing data (flagged as 99999 or negative pressure).
+                    // Skip levels with missing data
                     if pres > 0.0
                         && pres < 1100.0
                         && hght > -1000.0
@@ -353,95 +420,22 @@ fn parse_gsd(body: &str) -> Option<SoundingProfile> {
     }
 
     if levels.len() < 3 {
-        log::warn!("Sounding parse: insufficient levels ({})", levels.len());
+        log::warn!("GSD parse: insufficient levels ({})", levels.len());
+        return None;
+    }
+
+    // Filter out any NaN/Inf values that could cause panics downstream.
+    levels.retain(|l| l.pressure_mb.is_finite() && l.height_m.is_finite()
+        && l.temp_c.is_finite() && l.dewpoint_c.is_finite());
+
+    if levels.len() < 3 {
+        log::warn!("GSD parse: insufficient finite levels after filtering");
         return None;
     }
 
     // Sort by decreasing pressure (surface first, top last).
-    levels.sort_by(|a, b| b.pressure_mb.partial_cmp(&a.pressure_mb).unwrap());
+    levels.sort_by(|a, b| b.pressure_mb.partial_cmp(&a.pressure_mb)
+        .unwrap_or(std::cmp::Ordering::Equal));
 
-    let (cape, cin, lcl_m, srh_0_1, srh_0_3, bulk_shear_0_6, sig_tornado) =
-        compute_indices(&levels);
-
-    Some(SoundingProfile {
-        levels,
-        station,
-        valid_time,
-        cape,
-        cin,
-        lcl_m,
-        srh_0_1,
-        srh_0_3,
-        bulk_shear_0_6,
-        sig_tornado,
-    })
-}
-
-// ── Fetcher ─────────────────────────────────────────────────────────
-
-impl SoundingFetcher {
-    pub fn new(runtime: Handle) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("NexView/0.3 (github.com/FahrenheitResearch/nexview)")
-            .build()
-            .expect("Failed to build HTTP client for sounding fetcher");
-
-        Self {
-            http: Arc::new(client),
-            runtime,
-            result: Arc::new(Mutex::new(None)),
-            fetching: Arc::new(Mutex::new(false)),
-        }
-    }
-
-    /// Returns a reference to the latest fetched profile.
-    pub fn profile(&self) -> Option<SoundingProfile> {
-        self.result.lock().unwrap().clone()
-    }
-
-    /// Returns true if a fetch is currently in progress.
-    pub fn is_fetching(&self) -> bool {
-        *self.fetching.lock().unwrap()
-    }
-
-    /// Kick off an async fetch of a sounding at the given lat/lon.
-    pub fn fetch_sounding(&self, lat: f64, lon: f64) {
-        // Prevent concurrent fetches.
-        {
-            let mut f = self.fetching.lock().unwrap();
-            if *f {
-                return;
-            }
-            *f = true;
-        }
-
-        let http = Arc::clone(&self.http);
-        let result = Arc::clone(&self.result);
-        let fetching = Arc::clone(&self.fetching);
-
-        let url = format!(
-            "https://rucsoundings.noaa.gov/get_soundings.cgi?\
-             data_source=Op40&latest=latest&start_sounding=latest&\
-             n_hrs=1.0&fcst_len=shortest&airport={lat}%2C{lon}&\
-             text=Ascii%20text%20%28GSD%20format%29"
-        );
-
-        self.runtime.spawn(async move {
-            log::info!("Fetching sounding for ({lat:.2}, {lon:.2})");
-            match http.get(&url).send().await {
-                Ok(resp) => match resp.text().await {
-                    Ok(body) => {
-                        let profile = parse_gsd(&body);
-                        if profile.is_none() {
-                            log::warn!("Failed to parse sounding GSD response");
-                        }
-                        *result.lock().unwrap() = profile;
-                    }
-                    Err(e) => log::error!("Sounding body read error: {e}"),
-                },
-                Err(e) => log::error!("Sounding fetch error: {e}"),
-            }
-            *fetching.lock().unwrap() = false;
-        });
-    }
+    Some(SoundingProfile::new(levels, station, valid_time, lat, lon))
 }

@@ -13,6 +13,8 @@ pub enum RadarProduct {
     VIL,                         // Vertically Integrated Liquid (derived)
     EchoTops,                    // Echo Tops (derived)
     StormRelativeVelocity,       // SRV (computed from VEL + storm motion)
+    SuperResReflectivity,        // Super-Res REF (0.5° azimuth, 250m gates)
+    SuperResVelocity,            // Super-Res VEL (0.5° azimuth)
     Unknown,
 }
 
@@ -30,6 +32,8 @@ impl RadarProduct {
             "VIL" => RadarProduct::VIL,
             "ET" => RadarProduct::EchoTops,
             "SRV" => RadarProduct::StormRelativeVelocity,
+            "SR-R" => RadarProduct::SuperResReflectivity,
+            "SR-V" => RadarProduct::SuperResVelocity,
             _ => RadarProduct::Unknown,
         }
     }
@@ -47,6 +51,8 @@ impl RadarProduct {
             RadarProduct::VIL => "Vert. Integrated Liquid (VIL)",
             RadarProduct::EchoTops => "Echo Tops (ET)",
             RadarProduct::StormRelativeVelocity => "Storm Rel. Velocity (SRV)",
+            RadarProduct::SuperResReflectivity => "Super-Res Reflectivity (SR-R)",
+            RadarProduct::SuperResVelocity => "Super-Res Velocity (SR-V)",
             RadarProduct::Unknown => "Unknown",
         }
     }
@@ -64,6 +70,8 @@ impl RadarProduct {
             RadarProduct::VIL => "VIL",
             RadarProduct::EchoTops => "ET",
             RadarProduct::StormRelativeVelocity => "SRV",
+            RadarProduct::SuperResReflectivity => "SR-R",
+            RadarProduct::SuperResVelocity => "SR-V",
             RadarProduct::Unknown => "???",
         }
     }
@@ -81,8 +89,25 @@ impl RadarProduct {
             RadarProduct::VIL => "kg/m²",
             RadarProduct::EchoTops => "km",
             RadarProduct::StormRelativeVelocity => "kts",
+            RadarProduct::SuperResReflectivity => "dBZ",
+            RadarProduct::SuperResVelocity => "kts",
             RadarProduct::Unknown => "",
         }
+    }
+
+    /// Returns the underlying base product for super-res variants.
+    /// For non-super-res products, returns self.
+    pub fn base_product(&self) -> RadarProduct {
+        match self {
+            RadarProduct::SuperResReflectivity => RadarProduct::Reflectivity,
+            RadarProduct::SuperResVelocity => RadarProduct::Velocity,
+            _ => *self,
+        }
+    }
+
+    /// Returns true if this is a super-resolution product variant.
+    pub fn is_super_res(&self) -> bool {
+        matches!(self, RadarProduct::SuperResReflectivity | RadarProduct::SuperResVelocity)
     }
 
     pub fn all_products() -> &'static [RadarProduct] {
@@ -94,6 +119,8 @@ impl RadarProduct {
             RadarProduct::CorrelationCoefficient,
             RadarProduct::SpecificDiffPhase,
             RadarProduct::StormRelativeVelocity,
+            RadarProduct::SuperResReflectivity,
+            RadarProduct::SuperResVelocity,
         ]
     }
 }

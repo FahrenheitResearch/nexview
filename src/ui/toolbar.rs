@@ -4,6 +4,8 @@ use crate::nexrad::{RadarProduct, sites::RADAR_SITES};
 
 /// Products shown in the toolbar tab bar.
 const TOOLBAR_PRODUCTS: &[(RadarProduct, &str)] = &[
+    (RadarProduct::SuperResReflectivity, "SR-R"),
+    (RadarProduct::SuperResVelocity, "SR-V"),
     (RadarProduct::Reflectivity, "REF"),
     (RadarProduct::Velocity, "VEL"),
     (RadarProduct::SpectrumWidth, "SW"),
@@ -149,6 +151,11 @@ impl Toolbar {
             let response = ui.add(button);
 
             if response.clicked() {
+                if product == crate::nexrad::RadarProduct::StormRelativeVelocity
+                    && app.selected_product != crate::nexrad::RadarProduct::StormRelativeVelocity
+                {
+                    app.estimate_storm_motion();
+                }
                 app.selected_product = product;
                 app.needs_render = true;
             }

@@ -4,4 +4,4 @@ pub mod sounding;
 
 pub use alerts::{AlertFetcher, AlertSeverity, WeatherAlert};
 pub use aws::NexradFetcher;
-pub use sounding::{SoundingFetcher, SoundingProfile};
+pub use sounding::{SoundingFetcher, SoundingProfile, SoundingParams};
