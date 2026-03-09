@@ -1,6 +1,7 @@
 use chrono::{Datelike, Utc, NaiveDate};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::io::Read;
 use tokio::runtime::Handle;
 
 const NEXRAD_BASE_URL: &str = "https://unidata-nexrad-level2.s3.amazonaws.com";
@@ -42,7 +43,7 @@ impl NexradFetcher {
         }
     }
 
-    /// List available radar files for a given station and date
+    /// List available radar files for a given station and date, auto-download latest
     pub fn list_files(&self, station: &str, date: NaiveDate) {
         let station = station.to_uppercase();
 
@@ -58,6 +59,9 @@ impl NexradFetcher {
         let http = Arc::clone(&self.http);
         let files = Arc::clone(&self.available_files);
         let fetching = Arc::clone(&self.fetching);
+        let data = Arc::clone(&self.downloaded_data);
+        let progress = Arc::clone(&self.download_progress);
+        let dl_duration = Arc::clone(&self.download_duration);
 
         *fetching.lock().unwrap() = true;
 
@@ -75,7 +79,6 @@ impl NexradFetcher {
             match http.get(&url).send().await {
                 Ok(resp) => {
                     if let Ok(body) = resp.text().await {
-                        // Parse the XML response
                         all_files = Self::parse_s3_list_xml(&body);
                     }
                 }
@@ -85,6 +88,43 @@ impl NexradFetcher {
             }
 
             all_files.sort_by(|a, b| a.key.cmp(&b.key));
+
+            // Auto-download the latest file
+            if let Some(latest) = all_files.last() {
+                let key = latest.key.clone();
+                let display = latest.display_name.clone();
+                log::info!("Auto-downloading latest: {}", key);
+                *progress.lock().unwrap() = Some(format!("Downloading {}...", display));
+
+                let dl_start = Instant::now();
+                let url = format!("{}/{}", NEXRAD_BASE_URL, key);
+                match http.get(&url).send().await {
+                    Ok(resp) => {
+                        match resp.bytes().await {
+                            Ok(bytes) => {
+                                let elapsed = dl_start.elapsed();
+                                let raw = bytes.to_vec();
+                                log::info!("Downloaded {} bytes in {:.0}ms", raw.len(), elapsed.as_secs_f64() * 1000.0);
+                                *data.lock().unwrap() = Some(raw);
+                                *progress.lock().unwrap() = None;
+                                *dl_duration.lock().unwrap() = Some(elapsed);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to read body: {}", e);
+                                *progress.lock().unwrap() = Some(format!("Error: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to download: {}", e);
+                        *progress.lock().unwrap() = Some(format!("Error: {}", e));
+                    }
+                }
+            } else {
+                log::warn!("No NEXRAD files found for {} on {:?}", station, prefix);
+                *progress.lock().unwrap() = Some("No files found for this date".into());
+            }
+
             *files.lock().unwrap() = all_files;
             *fetching.lock().unwrap() = false;
         });
@@ -191,7 +231,7 @@ impl NexradFetcher {
                         match resp.bytes().await {
                             Ok(bytes) => {
                                 let elapsed = dl_start.elapsed();
-                                let raw = bytes.to_vec();
+                                let raw = Self::maybe_decompress_gz(bytes.to_vec());
                                 let mb_s = raw.len() as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64();
                                 log::info!("Downloaded {} bytes in {:.0}ms ({:.1} MB/s)", raw.len(), elapsed.as_secs_f64() * 1000.0, mb_s);
                                 *data.lock().unwrap() = Some(raw);
@@ -239,7 +279,7 @@ impl NexradFetcher {
                     match resp.bytes().await {
                         Ok(bytes) => {
                             let elapsed = dl_start.elapsed();
-                            let raw = bytes.to_vec();
+                            let raw = Self::maybe_decompress_gz(bytes.to_vec());
                             let mb_s = raw.len() as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64();
                             log::info!("Downloaded {} bytes in {:.0}ms ({:.1} MB/s)", raw.len(), elapsed.as_secs_f64() * 1000.0, mb_s);
                             *data.lock().unwrap() = Some(raw);
@@ -274,5 +314,95 @@ impl NexradFetcher {
 
     pub fn take_download_time(&self) -> Option<Duration> {
         self.download_duration.lock().unwrap().take()
+    }
+
+    /// Download multiple files in parallel (up to 4 concurrent), returning results via channel
+    pub fn download_files_parallel(&self, keys: Vec<String>) -> tokio::sync::mpsc::UnboundedReceiver<(usize, Vec<u8>)> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let http = Arc::clone(&self.http);
+
+        self.runtime.spawn(async move {
+            use tokio::sync::Semaphore;
+            let semaphore = Arc::new(Semaphore::new(4));
+            let mut handles = Vec::new();
+
+            for (idx, key) in keys.into_iter().enumerate() {
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let http = Arc::clone(&http);
+                let tx = tx.clone();
+
+                let handle = tokio::spawn(async move {
+                    let url = format!("{}/{}", NEXRAD_BASE_URL, key);
+                    let dl_start = Instant::now();
+
+                    match http.get(&url).send().await {
+                        Ok(resp) => {
+                            match resp.bytes().await {
+                                Ok(bytes) => {
+                                    let elapsed = dl_start.elapsed();
+                                    let raw = bytes.to_vec();
+                                    // Inline decompress: check gzip magic bytes
+                                    let data = if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+                                        let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
+                                        let mut decompressed = Vec::new();
+                                        match decoder.read_to_end(&mut decompressed) {
+                                            Ok(_) => {
+                                                log::info!("Decompressed gzip: {} -> {} bytes", raw.len(), decompressed.len());
+                                                decompressed
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Gzip decompression failed ({}), using raw data", e);
+                                                raw
+                                            }
+                                        }
+                                    } else {
+                                        raw
+                                    };
+                                    let mb_s = data.len() as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64();
+                                    log::info!("Parallel download [{}]: {} bytes in {:.0}ms ({:.1} MB/s)",
+                                        idx, data.len(), elapsed.as_secs_f64() * 1000.0, mb_s);
+                                    let _ = tx.send((idx, data));
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to read body for parallel download [{}]: {}", idx, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed parallel download [{}]: {}", idx, e);
+                        }
+                    }
+                    drop(permit);
+                });
+                handles.push(handle);
+            }
+
+            // Wait for all downloads to complete
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+
+        rx
+    }
+
+    /// Decompress gzip data if it starts with the gzip magic bytes
+    fn maybe_decompress_gz(data: Vec<u8>) -> Vec<u8> {
+        if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+            let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+            let mut decompressed = Vec::new();
+            match decoder.read_to_end(&mut decompressed) {
+                Ok(_) => {
+                    log::info!("Decompressed gzip: {} -> {} bytes", data.len(), decompressed.len());
+                    decompressed
+                }
+                Err(e) => {
+                    log::warn!("Gzip decompression failed ({}), using raw data", e);
+                    data
+                }
+            }
+        } else {
+            data
+        }
     }
 }

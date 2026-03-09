@@ -73,6 +73,13 @@ impl ControlBar {
                 ui.separator();
                 ui.checkbox(&mut app.quad_view, "Quad");
 
+                // Animation status in top bar
+                if !app.anim_frames.is_empty() {
+                    ui.separator();
+                    let status = if app.anim_playing { "Playing" } else { "Paused" };
+                    ui.label(format!("[{} {}/{}]", status, app.anim_index + 1, app.anim_frames.len()));
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("{:.4}°N {:.4}°W",
                         app.cursor_lat, -app.cursor_lon));

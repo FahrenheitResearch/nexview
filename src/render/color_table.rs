@@ -1,4 +1,27 @@
 use crate::nexrad::RadarProduct;
+use std::path::Path;
+
+/// Named preset styles for each product
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ColorTablePreset {
+    Default,
+    Dark,
+    Colorblind,
+}
+
+impl ColorTablePreset {
+    pub fn all() -> &'static [Self] {
+        &[Self::Default, Self::Dark, Self::Colorblind]
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Default => "Default",
+            Self::Dark => "Dark",
+            Self::Colorblind => "Colorblind",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ColorTable {
@@ -215,5 +238,100 @@ impl ColorTable {
             pixels.push(self.color_for_value(value));
         }
         pixels
+    }
+
+    /// Load from a .pal file (GR2Analyst format: lines of "value R G B [A]")
+    pub fn from_pal_file(path: &Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
+        Self::from_pal_string(&content, path.file_stem()?.to_str()?)
+    }
+
+    pub fn from_pal_string(content: &str, name: &str) -> Option<Self> {
+        let mut entries = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') || line.starts_with("//") {
+                continue;
+            }
+            // Try "Color: VALUE R G B [A]" format or plain "VALUE R G B [A]"
+            let line = line.strip_prefix("Color:").unwrap_or(line).trim();
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                if let (Ok(v), Ok(r), Ok(g), Ok(b)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<u8>(),
+                    parts[2].parse::<u8>(),
+                    parts[3].parse::<u8>(),
+                ) {
+                    let a = parts.get(4).and_then(|s| s.parse::<u8>().ok()).unwrap_or(255);
+                    entries.push(ColorEntry { value: v, r, g, b, a });
+                }
+            }
+        }
+        if entries.len() < 2 {
+            return None;
+        }
+        entries.sort_by(|a, b| a.value.partial_cmp(&b.value).unwrap());
+        let min = entries.first().unwrap().value;
+        let max = entries.last().unwrap().value;
+        Some(ColorTable {
+            name: name.to_string(),
+            min_value: min,
+            max_value: max,
+            entries,
+        })
+    }
+
+    /// Get a color table for a product with a given preset style
+    pub fn for_product_preset(product: RadarProduct, preset: ColorTablePreset) -> Self {
+        match preset {
+            ColorTablePreset::Default => Self::for_product(product),
+            ColorTablePreset::Dark => Self::dark_table(product),
+            ColorTablePreset::Colorblind => Self::colorblind_table(product),
+        }
+    }
+
+    fn dark_table(product: RadarProduct) -> Self {
+        // Dark theme: same structure but darker/more saturated colors
+        let mut table = Self::for_product(product);
+        table.name = format!("{} (Dark)", table.name);
+        // Boost saturation and darken backgrounds
+        for entry in &mut table.entries {
+            if entry.a < 200 {
+                entry.a = (entry.a as f32 * 0.7) as u8;
+            }
+            // Slightly increase color intensity
+            entry.r = (entry.r as f32 * 1.1).min(255.0) as u8;
+            entry.g = (entry.g as f32 * 1.1).min(255.0) as u8;
+            entry.b = (entry.b as f32 * 1.1).min(255.0) as u8;
+        }
+        table
+    }
+
+    fn colorblind_table(product: RadarProduct) -> Self {
+        match product {
+            RadarProduct::Reflectivity => ColorTable {
+                name: "Reflectivity (Colorblind)".into(),
+                min_value: -30.0,
+                max_value: 80.0,
+                entries: vec![
+                    ColorEntry { value: -30.0, r: 0, g: 0, b: 0, a: 0 },
+                    ColorEntry { value: 0.0, r: 230, g: 230, b: 230, a: 200 },
+                    ColorEntry { value: 10.0, r: 171, g: 217, b: 233, a: 255 },
+                    ColorEntry { value: 20.0, r: 44, g: 123, b: 182, a: 255 },
+                    ColorEntry { value: 30.0, r: 255, g: 255, b: 191, a: 255 },
+                    ColorEntry { value: 40.0, r: 253, g: 174, b: 97, a: 255 },
+                    ColorEntry { value: 50.0, r: 215, g: 25, b: 28, a: 255 },
+                    ColorEntry { value: 60.0, r: 128, g: 0, b: 38, a: 255 },
+                    ColorEntry { value: 70.0, r: 77, g: 0, b: 75, a: 255 },
+                    ColorEntry { value: 80.0, r: 255, g: 255, b: 255, a: 255 },
+                ],
+            },
+            _ => {
+                let mut t = Self::for_product(product);
+                t.name = format!("{} (Colorblind)", t.name);
+                t
+            }
+        }
     }
 }

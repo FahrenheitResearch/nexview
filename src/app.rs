@@ -1,8 +1,9 @@
 use eframe::egui;
 use std::time::{Duration, Instant};
+use chrono::{Datelike, NaiveDate};
 use crate::nexrad::{Level2File, RadarProduct, sites};
 use crate::render::{RadarRenderer, MapTileManager};
-use crate::render::map::MapView;
+use crate::render::map::{MapView, TileProvider};
 use crate::data::NexradFetcher;
 use crate::ui::{SidePanel, ControlBar};
 
@@ -73,9 +74,50 @@ pub struct RadarApp {
     // Data fetching
     pub fetcher: NexradFetcher,
 
+    // Date picker
+    pub date_year: i32,
+    pub date_month: u32,
+    pub date_day: u32,
+
+    // Cross section
+    pub cross_section_mode: bool,
+    pub cross_section_start: Option<(f64, f64)>,
+    pub cross_section_end: Option<(f64, f64)>,
+    pub cross_section_texture: Option<egui::TextureHandle>,
+    pub cross_section_result: Option<crate::render::cross_section::CrossSectionResult>,
+    pub cross_section_max_alt_km: f64,
+
+    // Animation / looping
+    pub anim_frames: Vec<Level2File>,
+    pub anim_frame_names: Vec<String>,
+    pub anim_index: usize,
+    pub anim_playing: bool,
+    pub anim_speed_ms: u64,
+    pub anim_last_advance: Option<Instant>,
+    pub anim_loading: bool,
+    pub anim_download_queue: Vec<String>, // keys to download (kept for reference)
+    pub anim_frame_count: usize, // how many frames to load
+    pub anim_download_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(usize, Vec<u8>)>>,
+    pub anim_pending_frames: Vec<Option<Level2File>>, // sparse vec filled as downloads complete
+    pub anim_received_count: usize, // how many frames received so far
+    pub pending_auto_anim: bool, // auto-load animation when file list arrives
+
+    // Pre-rendered animation textures
+    pub anim_textures: Vec<Option<egui::TextureHandle>>,
+    pub anim_quad_textures: Vec<[Option<egui::TextureHandle>; 4]>,
+
+    // Wall mode (multi-radar)
+    pub wall_mode: bool,
+    pub wall_panels: Vec<WallPanel>,
+    pub wall_loading_index: usize,
+    pub wall_fetcher: Option<NexradFetcher>,
+
     // Interaction
     pub cursor_lat: f64,
     pub cursor_lon: f64,
+
+    // Color table preset
+    pub color_preset: crate::render::color_table::ColorTablePreset,
 
     // Settings
     pub settings: AppSettings,
@@ -86,6 +128,29 @@ pub struct RadarApp {
     // Runtime
     runtime: tokio::runtime::Runtime,
 }
+
+pub struct WallPanel {
+    pub station_id: String,
+    pub file: Option<Level2File>,
+    pub texture: Option<egui::TextureHandle>,
+    pub status: WallPanelStatus,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum WallPanelStatus {
+    Pending,
+    Downloading,
+    Loaded,
+    Error,
+}
+
+/// Default wall stations — major metro area radars across the US
+pub const WALL_STATIONS: &[&str] = &[
+    "KTLX", "KFWS", "KAMA", "KHGX", "KLZK",
+    "KBMX", "KHTX", "KMRX", "KJAX", "KMFL",
+    "KLSX", "KIND", "KCLE", "KOKX", "KDIX",
+    "KPUX", "KFTG", "KFSD", "KMPX", "KSOX",
+];
 
 #[derive(Default)]
 pub struct PerfStats {
@@ -141,8 +206,43 @@ impl RadarApp {
 
             fetcher,
 
+            date_year: chrono::Utc::now().year(),
+            date_month: chrono::Utc::now().month(),
+            date_day: chrono::Utc::now().day(),
+
+            wall_mode: false,
+            wall_panels: Vec::new(),
+            wall_loading_index: 0,
+            wall_fetcher: None,
+
+            anim_frames: Vec::new(),
+            anim_frame_names: Vec::new(),
+            anim_index: 0,
+            anim_playing: false,
+            anim_speed_ms: 200,
+            anim_last_advance: None,
+            anim_loading: false,
+            anim_download_queue: Vec::new(),
+            anim_frame_count: 10,
+            anim_download_rx: None,
+            anim_pending_frames: Vec::new(),
+            anim_received_count: 0,
+            pending_auto_anim: false,
+
+            anim_textures: Vec::new(),
+            anim_quad_textures: Vec::new(),
+
+            cross_section_mode: false,
+            cross_section_start: None,
+            cross_section_end: None,
+            cross_section_texture: None,
+            cross_section_result: None,
+            cross_section_max_alt_km: 20.0,
+
             cursor_lat: 0.0,
             cursor_lon: 0.0,
+
+            color_preset: crate::render::color_table::ColorTablePreset::Default,
 
             settings: AppSettings::load(),
 
@@ -175,6 +275,386 @@ impl RadarApp {
 
     pub fn fetch_latest(&mut self) {
         self.fetcher.list_recent_files(&self.selected_station);
+    }
+
+    pub fn fetch_for_date(&mut self) {
+        if let Some(date) = NaiveDate::from_ymd_opt(self.date_year, self.date_month, self.date_day) {
+            self.fetcher.list_files(&self.selected_station, date);
+        }
+    }
+
+    pub fn start_wall_mode(&mut self) {
+        self.wall_mode = true;
+        self.wall_panels = WALL_STATIONS.iter().map(|&s| WallPanel {
+            station_id: s.to_string(),
+            file: None,
+            texture: None,
+            status: WallPanelStatus::Pending,
+        }).collect();
+        self.wall_loading_index = 0;
+
+        // Create a dedicated fetcher for wall mode
+        let handle = self.runtime.handle().clone();
+        self.wall_fetcher = Some(NexradFetcher::new(handle));
+
+        // Start loading the first station
+        if let Some(panel) = self.wall_panels.first_mut() {
+            panel.status = WallPanelStatus::Downloading;
+            self.wall_fetcher.as_ref().unwrap().list_recent_files(&panel.station_id);
+        }
+    }
+
+    fn check_wall_downloads(&mut self, ctx: &egui::Context) {
+        if !self.wall_mode {
+            return;
+        }
+
+        let fetcher = match &self.wall_fetcher {
+            Some(f) => f,
+            None => return,
+        };
+
+        let idx = self.wall_loading_index;
+        if idx >= self.wall_panels.len() {
+            return;
+        }
+
+        if let Some(data) = fetcher.take_downloaded_data() {
+            match Level2File::parse(&data) {
+                Ok(file) => {
+                    let product = self.selected_product;
+                    let station_id = self.wall_panels[idx].station_id.clone();
+                    let site = sites::find_site(&station_id);
+
+                    if let Some(site) = site {
+                        let sweep_idx = file.sweeps.iter().position(|s| {
+                            s.radials.iter().any(|r| r.moments.iter().any(|m| m.product == product))
+                        }).unwrap_or(0);
+
+                        if let Some(sweep) = file.sweeps.get(sweep_idx) {
+                            let rendered = RadarRenderer::render_sweep(sweep, product, site, 256);
+                            if let Some(rendered) = rendered {
+                                let image = egui::ColorImage::from_rgba_unmultiplied(
+                                    [rendered.width as usize, rendered.height as usize],
+                                    &rendered.pixels,
+                                );
+                                self.wall_panels[idx].texture = Some(ctx.load_texture(
+                                    format!("wall_{}", station_id),
+                                    image,
+                                    egui::TextureOptions::NEAREST,
+                                ));
+                            }
+                        }
+                    }
+
+                    self.wall_panels[idx].file = Some(file);
+                    self.wall_panels[idx].status = WallPanelStatus::Loaded;
+                    log::info!("Wall: loaded {} ({}/{})", station_id, idx + 1, self.wall_panels.len());
+                }
+                Err(e) => {
+                    log::error!("Wall: failed to parse {}: {}", self.wall_panels[idx].station_id, e);
+                    self.wall_panels[idx].status = WallPanelStatus::Error;
+                }
+            }
+
+            // Move to next station
+            self.wall_loading_index += 1;
+            if self.wall_loading_index < self.wall_panels.len() {
+                let next_station = self.wall_panels[self.wall_loading_index].station_id.clone();
+                self.wall_panels[self.wall_loading_index].status = WallPanelStatus::Downloading;
+                self.wall_fetcher.as_ref().unwrap().list_recent_files(&next_station);
+            }
+        } else if !fetcher.is_fetching() {
+            // Fetcher finished but no data — station had no files, skip it
+            log::warn!("Wall: no data for {} — skipping", self.wall_panels[idx].station_id);
+            self.wall_panels[idx].status = WallPanelStatus::Error;
+            self.wall_loading_index += 1;
+            if self.wall_loading_index < self.wall_panels.len() {
+                let next_station = self.wall_panels[self.wall_loading_index].station_id.clone();
+                self.wall_panels[self.wall_loading_index].status = WallPanelStatus::Downloading;
+                self.wall_fetcher.as_ref().unwrap().list_recent_files(&next_station);
+            }
+        }
+    }
+
+    fn draw_wall_mode(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let count = self.wall_panels.len();
+        if count == 0 {
+            return;
+        }
+
+        // Calculate grid layout
+        let cols = (count as f32).sqrt().ceil() as usize;
+        let rows = (count + cols - 1) / cols;
+        let cell_w = rect.width() / cols as f32;
+        let cell_h = rect.height() / rows as f32;
+
+        for (i, panel) in self.wall_panels.iter().enumerate() {
+            let col = i % cols;
+            let row = i / cols;
+            let cell_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + col as f32 * cell_w, rect.top() + row as f32 * cell_h),
+                egui::vec2(cell_w, cell_h),
+            );
+
+            // Dark background
+            ui.painter().rect_filled(cell_rect, 0.0, egui::Color32::from_rgb(15, 15, 25));
+
+            // Radar texture
+            if let Some(tex) = &panel.texture {
+                let margin = 2.0;
+                let img_rect = cell_rect.shrink(margin);
+                // Keep square, centered
+                let side = img_rect.width().min(img_rect.height());
+                let centered = egui::Rect::from_center_size(img_rect.center(), egui::vec2(side, side));
+                ui.painter().image(
+                    tex.id(),
+                    centered,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+
+            // Station label
+            let label_bg = egui::Rect::from_min_size(cell_rect.min, egui::vec2(60.0, 18.0));
+            ui.painter().rect_filled(label_bg, 2.0, egui::Color32::from_black_alpha(200));
+
+            let status_color = match panel.status {
+                WallPanelStatus::Loaded => egui::Color32::from_rgb(100, 255, 100),
+                WallPanelStatus::Downloading => egui::Color32::YELLOW,
+                WallPanelStatus::Error => egui::Color32::RED,
+                WallPanelStatus::Pending => egui::Color32::GRAY,
+            };
+
+            ui.painter().text(
+                cell_rect.min + egui::vec2(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                &panel.station_id,
+                egui::FontId::proportional(12.0),
+                status_color,
+            );
+
+            // Border
+            ui.painter().rect_stroke(cell_rect, 0.0, egui::Stroke::new(0.5, egui::Color32::from_gray(40)), egui::StrokeKind::Outside);
+        }
+    }
+
+    pub fn set_tile_provider(&mut self, provider: TileProvider) {
+        self.tile_manager.set_provider(provider);
+        self.tile_textures.clear();
+    }
+
+    /// Start loading the last N frames for animation
+    pub fn load_animation_frames(&mut self) {
+        let files = self.fetcher.available_files.lock().unwrap().clone();
+        if files.is_empty() {
+            return;
+        }
+
+        // Take the last N files
+        let count = self.anim_frame_count.min(files.len());
+        let start = files.len() - count;
+        let keys: Vec<String> = files[start..].iter().map(|f| f.key.clone()).collect();
+        let names: Vec<String> = files[start..].iter().map(|f| f.display_name.clone()).collect();
+
+        let num_keys = keys.len();
+        self.anim_frames.clear();
+        self.anim_textures.clear();
+        self.anim_quad_textures.clear();
+        self.anim_frame_names = names;
+        self.anim_download_queue = keys.clone();
+        self.anim_loading = true;
+        self.anim_index = 0;
+        self.anim_playing = false;
+        self.anim_pending_frames = vec![None; num_keys];
+        self.anim_received_count = 0;
+
+        // Start parallel downloads (up to 4 concurrent)
+        let rx = self.fetcher.download_files_parallel(keys);
+        self.anim_download_rx = Some(rx);
+    }
+
+    fn check_animation_downloads(&mut self, ctx: &egui::Context) {
+        if !self.anim_loading {
+            return;
+        }
+
+        ctx.request_repaint();
+
+        // Poll the parallel download receiver (process up to 2 per frame to avoid blocking UI)
+        let mut processed = 0;
+        if let Some(rx) = &mut self.anim_download_rx {
+            while processed < 2 {
+                match rx.try_recv() {
+                    Ok((idx, data)) => {
+                        processed += 1;
+                        match Level2File::parse(&data) {
+                            Ok(file) => {
+                                if idx < self.anim_pending_frames.len() {
+                                    self.anim_pending_frames[idx] = Some(file);
+                                }
+                                self.anim_received_count += 1;
+                                log::info!("Animation frame {}/{} loaded (index {})",
+                                    self.anim_received_count, self.anim_download_queue.len(), idx);
+                            }
+                            Err(e) => {
+                                self.anim_received_count += 1;
+                                log::error!("Failed to parse animation frame {}: {}", idx, e);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Check if all frames are received
+        let total = self.anim_download_queue.len();
+        if self.anim_received_count >= total && total > 0 {
+            // Compact: collect non-None frames in order
+            self.anim_frames = self.anim_pending_frames
+                .iter_mut()
+                .filter_map(|slot| slot.take())
+                .collect();
+            self.anim_pending_frames.clear();
+            self.anim_download_rx = None;
+
+            self.anim_loading = false;
+            self.anim_playing = true;
+            self.anim_last_advance = Some(Instant::now());
+            if !self.anim_frames.is_empty() {
+                self.current_file = Some(self.anim_frames[0].clone());
+                self.needs_render = true;
+            }
+            log::info!("Animation loaded: {} frames (parallel)", self.anim_frames.len());
+            // Pre-render all animation frame textures for smooth playback
+            self.pre_render_animation_textures(ctx);
+        }
+    }
+
+    /// Pre-render all animation frames to texture handles for smooth playback.
+    /// This avoids re-rendering each frame on every animation advance.
+    fn pre_render_animation_textures(&mut self, ctx: &egui::Context) {
+        if self.anim_frames.is_empty() {
+            return;
+        }
+
+        let site = match sites::find_site(&self.selected_station) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let pre_start = Instant::now();
+        let num_frames = self.anim_frames.len();
+        let mut single_textures: Vec<Option<egui::TextureHandle>> = Vec::with_capacity(num_frames);
+        let mut quad_textures: Vec<[Option<egui::TextureHandle>; 4]> = Vec::with_capacity(num_frames);
+
+        // Save original state
+        let orig_file = self.current_file.take();
+
+        for (fi, frame) in self.anim_frames.iter().enumerate() {
+            // Temporarily set current_file so find_sweep_for_product works
+            self.current_file = Some(frame.clone());
+
+            // Render single-view texture
+            let sweep_idx = self.find_sweep_for_product(self.selected_product)
+                .unwrap_or(self.selected_elevation);
+
+            let single_tex = if let Some(sweep) = frame.sweeps.get(sweep_idx) {
+                let rendered = RadarRenderer::render_sweep(sweep, self.selected_product, site, 1024);
+                rendered.map(|r| {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [r.width as usize, r.height as usize],
+                        &r.pixels,
+                    );
+                    ctx.load_texture(
+                        format!("anim_single_{}", fi),
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    )
+                })
+            } else {
+                None
+            };
+            single_textures.push(single_tex);
+
+            // Render quad-view textures
+            let mut quad: [Option<egui::TextureHandle>; 4] = [None, None, None, None];
+            if self.quad_view {
+                for (qi, &product) in QUAD_PRODUCTS.iter().enumerate() {
+                    let qsweep_idx = self.find_sweep_for_product(product);
+                    let qsweep = qsweep_idx.and_then(|idx| frame.sweeps.get(idx));
+
+                    if let Some(sweep) = qsweep {
+                        let rendered = RadarRenderer::render_sweep(sweep, product, site, 512);
+                        if let Some(r) = rendered {
+                            let image = egui::ColorImage::from_rgba_unmultiplied(
+                                [r.width as usize, r.height as usize],
+                                &r.pixels,
+                            );
+                            quad[qi] = Some(ctx.load_texture(
+                                format!("anim_quad_{}_{}", fi, qi),
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            ));
+                        }
+                    }
+                }
+            }
+            quad_textures.push(quad);
+        }
+
+        // Restore original state
+        self.current_file = orig_file;
+
+        self.anim_textures = single_textures;
+        self.anim_quad_textures = quad_textures;
+
+        log::info!(
+            "Pre-rendered {} animation frame textures in {:.1}ms",
+            num_frames,
+            pre_start.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+
+    fn advance_animation(&mut self) {
+        if !self.anim_playing || self.anim_frames.is_empty() {
+            return;
+        }
+
+        let should_advance = match self.anim_last_advance {
+            Some(last) => last.elapsed().as_millis() >= self.anim_speed_ms as u128,
+            None => true,
+        };
+
+        if should_advance {
+            self.anim_index = (self.anim_index + 1) % self.anim_frames.len();
+            self.anim_last_advance = Some(Instant::now());
+
+            // Try to use pre-rendered cached textures
+            let has_cached_single = self.anim_textures.get(self.anim_index)
+                .and_then(|t| t.as_ref()).is_some();
+            let has_cached_quad = self.anim_quad_textures.get(self.anim_index).is_some();
+
+            if has_cached_single || has_cached_quad {
+                // Swap in cached textures directly — no clone or re-render needed
+                if let Some(cached) = self.anim_textures.get(self.anim_index) {
+                    self.single_texture = cached.clone();
+                }
+                if self.quad_view {
+                    if let Some(cached_quad) = self.anim_quad_textures.get(self.anim_index) {
+                        self.quad_textures = cached_quad.clone();
+                    }
+                }
+                // Still update current_file for UI display (frame name, elevation info, etc.)
+                self.current_file = Some(self.anim_frames[self.anim_index].clone());
+                // Do NOT set needs_render — textures are already ready
+            } else {
+                // Fallback: no cached textures, render the old way
+                self.current_file = Some(self.anim_frames[self.anim_index].clone());
+                self.needs_render = true;
+            }
+        }
     }
 
     /// Find the best sweep for a given product.
@@ -247,6 +727,16 @@ impl RadarApp {
             self.perf.download_time = Some(dl_time);
         }
 
+        // Auto-load animation after file list arrives (e.g., from historic event)
+        if self.pending_auto_anim && !self.fetcher.is_fetching() {
+            let files = self.fetcher.available_files.lock().unwrap();
+            if !files.is_empty() {
+                drop(files);
+                self.pending_auto_anim = false;
+                self.load_animation_frames();
+            }
+        }
+
         ctx.request_repaint();
     }
 
@@ -287,7 +777,7 @@ impl RadarApp {
                         self.quad_textures[i] = Some(ctx.load_texture(
                             format!("radar_quad_{}", i),
                             image,
-                            egui::TextureOptions::LINEAR,
+                            egui::TextureOptions::NEAREST,
                         ));
                     } else {
                         self.quad_textures[i] = None;
@@ -312,7 +802,7 @@ impl RadarApp {
                 self.single_texture = Some(ctx.load_texture(
                     "radar_single",
                     image,
-                    egui::TextureOptions::LINEAR,
+                    egui::TextureOptions::NEAREST,
                 ));
             } else {
                 self.single_texture = None;
@@ -363,8 +853,15 @@ impl RadarApp {
             }
         }
 
-        let visible_set: std::collections::HashSet<_> = visible.iter().copied().collect();
-        self.tile_textures.retain(|k, _| visible_set.contains(k));
+        // Prefetch tiles for expanded viewport and one zoom level up
+        let prefetch = self.map_view.prefetch_tiles(screen_w, screen_h);
+        for key in &prefetch {
+            self.tile_manager.request_tile(*key);
+        }
+
+        // Retain textures for both visible and prefetched tiles
+        let retain_set: std::collections::HashSet<_> = visible.iter().chain(prefetch.iter()).copied().collect();
+        self.tile_textures.retain(|k, _| retain_set.contains(k));
     }
 
     fn get_radar_rect(&self, rect: egui::Rect, product: RadarProduct) -> Option<egui::Rect> {
@@ -462,10 +959,11 @@ impl RadarApp {
             // Draw map tiles in this quadrant
             self.draw_map_in_rect(ui, quad_rect);
 
-            // Draw radar overlay
+            // Draw radar overlay (clipped to quadrant)
             if let Some(tex) = &self.quad_textures[i] {
                 if let Some(radar_rect) = self.get_radar_rect(quad_rect, product) {
-                    ui.painter().image(
+                    let clipped = ui.painter_at(quad_rect);
+                    clipped.image(
                         tex.id(),
                         radar_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -497,6 +995,9 @@ impl RadarApp {
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
 
+        // Clip to quadrant bounds so tiles don't bleed across quadrants
+        let painter = ui.painter_at(rect);
+
         let visible = self.map_view.visible_tiles(screen_w, screen_h);
         for key in &visible {
             if let Some(tex) = self.tile_textures.get(key) {
@@ -509,7 +1010,7 @@ impl RadarApp {
                 );
 
                 if tile_rect.intersects(rect) {
-                    ui.painter().image(
+                    painter.image(
                         tex.id(),
                         tile_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -599,6 +1100,39 @@ impl RadarApp {
                 self.quad_view = !self.quad_view;
                 self.needs_render = true;
             }
+
+            // W: toggle wall mode
+            if i.key_pressed(egui::Key::W) {
+                if self.wall_mode {
+                    self.wall_mode = false;
+                } else {
+                    self.start_wall_mode();
+                }
+            }
+
+            // Space: play/pause animation
+            if i.key_pressed(egui::Key::Space) {
+                if !self.anim_frames.is_empty() {
+                    self.anim_playing = !self.anim_playing;
+                    if self.anim_playing {
+                        self.anim_last_advance = Some(Instant::now());
+                    }
+                }
+            }
+
+            // Comma/Period: step backward/forward through animation frames
+            if i.key_pressed(egui::Key::Period) && !self.anim_frames.is_empty() {
+                self.anim_playing = false;
+                self.anim_index = (self.anim_index + 1) % self.anim_frames.len();
+                self.current_file = Some(self.anim_frames[self.anim_index].clone());
+                self.needs_render = true;
+            }
+            if i.key_pressed(egui::Key::Comma) && !self.anim_frames.is_empty() {
+                self.anim_playing = false;
+                self.anim_index = if self.anim_index == 0 { self.anim_frames.len() - 1 } else { self.anim_index - 1 };
+                self.current_file = Some(self.anim_frames[self.anim_index].clone());
+                self.needs_render = true;
+            }
         });
     }
 
@@ -633,15 +1167,84 @@ impl RadarApp {
             if let Some(pos) = response.interact_pointer_pos() {
                 let click_x = (pos.x - rect.left()) as f64;
                 let click_y = (pos.y - rect.top()) as f64;
+                let (lat, lon) = self.map_view.pixel_to_lat_lon(click_x, click_y, screen_w, screen_h);
 
-                for site in sites::RADAR_SITES.iter() {
-                    let (sx, sy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
-                    let dist = ((click_x - sx).powi(2) + (click_y - sy).powi(2)).sqrt();
-                    if dist < 10.0 {
-                        self.select_station(site.id);
-                        break;
+                if self.cross_section_mode {
+                    if self.cross_section_start.is_none() {
+                        self.cross_section_start = Some((lat, lon));
+                    } else {
+                        self.cross_section_end = Some((lat, lon));
+                        self.cross_section_mode = false;
+                        self.render_cross_section_image();
+                    }
+                } else {
+                    for site in sites::RADAR_SITES.iter() {
+                        let (sx, sy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
+                        let dist = ((click_x - sx).powi(2) + (click_y - sy).powi(2)).sqrt();
+                        if dist < 10.0 {
+                            self.select_station(site.id);
+                            break;
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    fn render_cross_section_image(&mut self) {
+        let start = match self.cross_section_start {
+            Some(s) => s,
+            None => return,
+        };
+        let end = match self.cross_section_end {
+            Some(e) => e,
+            None => return,
+        };
+        let file = match &self.current_file {
+            Some(f) => f,
+            None => return,
+        };
+        let site = match sites::find_site(&self.selected_station) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let color_table = crate::render::ColorTable::for_product_preset(self.selected_product, self.color_preset);
+        let result = crate::render::CrossSectionRenderer::render_cross_section(
+            file, self.selected_product, &color_table, site, start, end, 800, 300,
+        );
+
+        // Texture will be created in the update loop since we need ctx
+        // Store the result temporarily
+        if let Some(res) = result {
+            self.cross_section_result = Some(res);
+        }
+    }
+
+    fn draw_cross_section_line(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let screen_w = rect.width() as f64;
+        let screen_h = rect.height() as f64;
+
+        if let Some(start) = self.cross_section_start {
+            let (sx, sy) = self.map_view.lat_lon_to_pixel(start.0, start.1, screen_w, screen_h);
+            let start_pos = egui::pos2(rect.left() + sx as f32, rect.top() + sy as f32);
+
+            // Draw start marker
+            ui.painter().circle_filled(start_pos, 6.0, egui::Color32::from_rgb(255, 100, 100));
+
+            let end_point = self.cross_section_end.unwrap_or((self.cursor_lat, self.cursor_lon));
+            let (ex, ey) = self.map_view.lat_lon_to_pixel(end_point.0, end_point.1, screen_w, screen_h);
+            let end_pos = egui::pos2(rect.left() + ex as f32, rect.top() + ey as f32);
+
+            // Draw line
+            ui.painter().line_segment(
+                [start_pos, end_pos],
+                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 100, 100)),
+            );
+
+            // Draw end marker
+            if self.cross_section_end.is_some() {
+                ui.painter().circle_filled(end_pos, 6.0, egui::Color32::from_rgb(255, 100, 100));
             }
         }
     }
@@ -666,12 +1269,86 @@ impl eframe::App for RadarApp {
         }
         self.perf.last_frame_start = Some(frame_start);
 
-        self.check_downloads(ctx);
+        // Animation downloads use the same fetcher — don't let check_downloads steal data
+        if self.anim_loading {
+            self.check_animation_downloads(ctx);
+        } else {
+            self.check_downloads(ctx);
+        }
+        self.check_wall_downloads(ctx);
+        self.advance_animation();
         self.handle_keyboard(ctx);
         self.render_radar(ctx);
 
+        // Create cross-section texture if result is pending
+        if let Some(res) = self.cross_section_result.take() {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [res.width as usize, res.height as usize],
+                &res.pixels,
+            );
+            self.cross_section_texture = Some(ctx.load_texture(
+                "cross_section",
+                image,
+                egui::TextureOptions::NEAREST,
+            ));
+            self.cross_section_max_alt_km = res.max_altitude_km;
+        }
+
         ControlBar::show(self, ctx);
         SidePanel::show(self, ctx);
+
+        // Cross-section window (bottom panel)
+        if self.cross_section_texture.is_some() {
+            egui::TopBottomPanel::bottom("cross_section_panel")
+                .resizable(true)
+                .default_height(250.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Cross Section");
+                        ui.label(format!("| Max alt: {:.0} km", self.cross_section_max_alt_km));
+                        if ui.button("Close").clicked() {
+                            self.cross_section_texture = None;
+                            self.cross_section_start = None;
+                            self.cross_section_end = None;
+                        }
+                    });
+                    if let Some(tex) = &self.cross_section_texture {
+                        let available_w = ui.available_width();
+                        let aspect = tex.size()[0] as f32 / tex.size()[1] as f32;
+                        let h = (available_w / aspect).min(220.0).max(100.0);
+
+                        // Allocate the space so egui knows the panel needs it
+                        let (img_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(available_w, h),
+                            egui::Sense::hover(),
+                        );
+
+                        // Dark background
+                        ui.painter().rect_filled(img_rect, 0.0, egui::Color32::from_rgb(10, 10, 20));
+
+                        ui.painter().image(
+                            tex.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+
+                        // Altitude axis labels
+                        for i in 0..=4 {
+                            let t = i as f32 / 4.0;
+                            let alt = self.cross_section_max_alt_km * (1.0 - t as f64);
+                            let y = img_rect.top() + t * h;
+                            ui.painter().text(
+                                egui::pos2(img_rect.left() + 4.0, y),
+                                egui::Align2::LEFT_TOP,
+                                format!("{:.0}km", alt),
+                                egui::FontId::proportional(10.0),
+                                egui::Color32::from_gray(200),
+                            );
+                        }
+                    }
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(20, 20, 30)))
@@ -681,8 +1358,9 @@ impl eframe::App for RadarApp {
 
                 ui.painter().rect_filled(available_rect, 0.0, egui::Color32::from_rgb(20, 20, 30));
 
-                if self.quad_view {
-                    // Pre-fetch tiles for all quadrants
+                if self.wall_mode {
+                    self.draw_wall_mode(ui, available_rect);
+                } else if self.quad_view {
                     let screen_w = (available_rect.width() / 2.0) as f64;
                     let screen_h = (available_rect.height() / 2.0) as f64;
                     let visible = self.map_view.visible_tiles(screen_w, screen_h);
@@ -702,11 +1380,21 @@ impl eframe::App for RadarApp {
                             });
                         }
                     }
+                    // Prefetch tiles for expanded viewport and zoom-out
+                    let prefetch = self.map_view.prefetch_tiles(screen_w, screen_h);
+                    for key in &prefetch {
+                        self.tile_manager.request_tile(*key);
+                    }
                     self.draw_quad_overlay(ui, available_rect);
                 } else {
                     self.draw_map(ui, available_rect);
                     self.draw_radar_overlay(ui, available_rect);
                     self.draw_radar_sites(ui, available_rect);
+                }
+
+                // Draw cross-section line on map
+                if self.cross_section_start.is_some() {
+                    self.draw_cross_section_line(ui, available_rect);
                 }
 
                 self.handle_interaction(&response, available_rect);
