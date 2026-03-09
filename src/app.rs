@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use chrono::{Datelike, NaiveDate};
 use crate::nexrad::{Level2File, RadarProduct, sites};
@@ -35,7 +36,7 @@ impl Default for AppSettings {
         Self {
             default_station: "KTLX".into(),
             default_zoom: 7.0,
-            quad_view: true,
+            quad_view: false,
         }
     }
 }
@@ -208,6 +209,8 @@ pub struct RadarApp {
     // Preload engine
     #[cfg(not(target_arch = "wasm32"))]
     pub preload_engine: Option<crate::preload::PreloadEngine>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub last_preload_sync: Option<Instant>,
 
     // Runtime (native only — wasm uses browser event loop)
     #[cfg(not(target_arch = "wasm32"))]
@@ -247,7 +250,7 @@ pub struct PerfStats {
     pub decompress_time: Option<Duration>,
     pub total_radials: usize,
     pub total_gates: usize,
-    pub frame_times: Vec<Duration>,
+    pub frame_times: VecDeque<Duration>,
     pub last_frame_start: Option<Instant>,
     pub fps: f64,
 }
@@ -351,8 +354,8 @@ impl RadarApp {
 
             color_preset: crate::render::color_table::ColorTablePreset::Default,
 
+            gpu_rendering: gpu_renderer.is_some(),
             gpu_renderer,
-            gpu_rendering: false,
             last_render_range_km: None,
             quad_render_range_km: [None; 4],
 
@@ -361,7 +364,7 @@ impl RadarApp {
 
             meso_detections: Vec::new(),
             tvs_detections: Vec::new(),
-            show_detections: true,
+            show_detections: false,
 
             dual_pane: false,
             dual_pane_product: RadarProduct::Velocity,
@@ -406,6 +409,8 @@ impl RadarApp {
 
             #[cfg(not(target_arch = "wasm32"))]
             preload_engine: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_preload_sync: None,
 
             #[cfg(not(target_arch = "wasm32"))]
             runtime,
@@ -444,6 +449,28 @@ impl RadarApp {
             self.map_view.center_lat = site.lat;
             self.map_view.center_lon = site.lon;
         }
+
+        // Try to load from preload cache first (instant switch)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cached_file = self.preload_engine.as_ref().and_then(|engine| {
+                let cache = engine.get_cache();
+                let guard = cache.try_read().ok()?;
+                guard.get(station_id).map(|cached| cached.file.clone())
+            });
+            if let Some(file) = cached_file {
+                self.current_file = Some(file);
+                self.selected_elevation = 0;
+                self.needs_render = true;
+                log::info!("Loaded {} from preload cache (instant)", station_id);
+                // Still fetch in background to get the absolute latest,
+                // but user sees data immediately
+                self.fetch_latest();
+                return;
+            }
+        }
+
+        // Fall back to S3 fetch
         self.fetch_latest();
     }
 
@@ -483,9 +510,11 @@ impl RadarApp {
         }
 
         // Start loading the first station
-        if let Some(panel) = self.wall_panels.first_mut() {
-            panel.status = WallPanelStatus::Downloading;
-            self.wall_fetcher.as_ref().unwrap().list_recent_files(&panel.station_id);
+        if let Some(ref fetcher) = self.wall_fetcher {
+            if let Some(panel) = self.wall_panels.first_mut() {
+                panel.status = WallPanelStatus::Downloading;
+                fetcher.list_recent_files(&panel.station_id);
+            }
         }
     }
 
@@ -508,16 +537,18 @@ impl RadarApp {
             match Level2File::parse(&data) {
                 Ok(file) => {
                     let product = self.selected_product;
+                    let base = product.base_product();
+                    let require_sr = product.is_super_res();
                     let station_id = self.wall_panels[idx].station_id.clone();
                     let site = sites::find_site(&station_id);
 
                     if let Some(site) = site {
                         let sweep_idx = file.sweeps.iter().position(|s| {
-                            s.radials.iter().any(|r| r.moments.iter().any(|m| m.product == product))
+                            Self::sweep_matches(s, base, require_sr)
                         }).unwrap_or(0);
 
                         if let Some(sweep) = file.sweeps.get(sweep_idx) {
-                            let rendered = RadarRenderer::render_sweep(sweep, product, site, 256);
+                            let rendered = RadarRenderer::render_sweep(sweep, base, site, 256);
                             if let Some(rendered) = rendered {
                                 let image = egui::ColorImage::from_rgba_unmultiplied(
                                     [rendered.width as usize, rendered.height as usize],
@@ -547,7 +578,7 @@ impl RadarApp {
             if self.wall_loading_index < self.wall_panels.len() {
                 let next_station = self.wall_panels[self.wall_loading_index].station_id.clone();
                 self.wall_panels[self.wall_loading_index].status = WallPanelStatus::Downloading;
-                self.wall_fetcher.as_ref().unwrap().list_recent_files(&next_station);
+                fetcher.list_recent_files(&next_station);
             }
         } else if !fetcher.is_fetching() {
             // Fetcher finished but no data — station had no files, skip it
@@ -557,7 +588,7 @@ impl RadarApp {
             if self.wall_loading_index < self.wall_panels.len() {
                 let next_station = self.wall_panels[self.wall_loading_index].station_id.clone();
                 self.wall_panels[self.wall_loading_index].status = WallPanelStatus::Downloading;
-                self.wall_fetcher.as_ref().unwrap().list_recent_files(&next_station);
+                fetcher.list_recent_files(&next_station);
             }
         }
     }
@@ -814,7 +845,7 @@ impl RadarApp {
                 .unwrap_or(self.selected_elevation);
 
             let single_tex = if let Some(sweep) = frame.sweeps.get(sweep_idx) {
-                let rendered = RadarRenderer::render_sweep(sweep, self.selected_product, site, 1024);
+                let rendered = RadarRenderer::render_sweep(sweep, self.selected_product.base_product(), site, 1024);
                 rendered.map(|r| {
                     let image = egui::ColorImage::from_rgba_unmultiplied(
                         [r.width as usize, r.height as usize],
@@ -904,7 +935,7 @@ impl RadarApp {
             if let Some(sweep) = frame.sweeps.get(sweep_idx) {
                 if let Some(rendered) = RadarRenderer::render_sweep(
                     sweep,
-                    self.selected_product,
+                    self.selected_product.base_product(),
                     site,
                     1024,
                 ) {
@@ -984,43 +1015,65 @@ impl RadarApp {
     /// storm_motion_dir / storm_motion_speed fields.
     pub fn estimate_storm_motion(&mut self) {
         if let Some(ref file) = self.current_file {
-            let vel_idx = self.find_sweep_for_product(RadarProduct::Velocity);
-            if let Some(idx) = vel_idx {
-                if let Some(vel_sweep) = file.sweeps.get(idx) {
-                    let (dir, speed) =
-                        crate::nexrad::srv::SRVComputer::estimate_storm_motion(vel_sweep);
-                    self.storm_motion_dir = dir;
-                    self.storm_motion_speed = speed;
-                }
+            // Collect all velocity sweeps for multi-elevation estimation
+            let vel_sweeps: Vec<&crate::nexrad::level2::Level2Sweep> = file
+                .sweeps
+                .iter()
+                .filter(|s| {
+                    s.radials.iter().any(|r| {
+                        r.moments
+                            .iter()
+                            .any(|m| m.product == RadarProduct::Velocity)
+                    })
+                })
+                .collect();
+            if !vel_sweeps.is_empty() {
+                let (dir, speed) =
+                    crate::nexrad::srv::SRVComputer::estimate_storm_motion(&vel_sweeps);
+                self.storm_motion_dir = dir;
+                self.storm_motion_speed = speed;
             }
         }
     }
 
     /// Find the best sweep for a given product.
     /// NEXRAD splits products across different sweeps at the same elevation.
+    /// For super-res products, only sweeps with azimuth_spacing <= 0.5 are considered.
     pub fn find_sweep_for_product(&self, product: RadarProduct) -> Option<usize> {
         let file = self.current_file.as_ref()?;
+        let base = product.base_product();
+        let require_super_res = product.is_super_res();
 
         // First, try to find a sweep at the selected elevation that has this product
         if let Some(sweep) = file.sweeps.get(self.selected_elevation) {
-            let has_product = sweep.radials.iter().any(|r| {
-                r.moments.iter().any(|m| m.product == product)
-            });
-            if has_product {
+            if Self::sweep_matches(sweep, base, require_super_res) {
                 return Some(self.selected_elevation);
             }
         }
 
         // Otherwise, find the lowest elevation sweep that has this product
         for (i, sweep) in file.sweeps.iter().enumerate() {
-            let has_product = sweep.radials.iter().any(|r| {
-                r.moments.iter().any(|m| m.product == product)
-            });
-            if has_product {
+            if Self::sweep_matches(sweep, base, require_super_res) {
                 return Some(i);
             }
         }
         None
+    }
+
+    /// Check if a sweep contains the given product and matches super-res requirements.
+    fn sweep_matches(sweep: &crate::nexrad::Level2Sweep, product: RadarProduct, require_super_res: bool) -> bool {
+        let has_product = sweep.radials.iter().any(|r| {
+            r.moments.iter().any(|m| m.product == product)
+        });
+        if !has_product {
+            return false;
+        }
+        if require_super_res {
+            // Super-res: azimuth_spacing must be <= 0.5 degrees
+            sweep.radials.first().map_or(false, |r| r.azimuth_spacing <= 0.5)
+        } else {
+            true
+        }
     }
 
     fn check_downloads(&mut self, ctx: &egui::Context) {
@@ -1064,6 +1117,9 @@ impl RadarApp {
                     self.current_file = Some(file);
                     self.selected_elevation = 0;
                     self.needs_render = true;
+
+                    // Auto-estimate storm motion from fresh velocity data
+                    self.estimate_storm_motion();
 
                     // Start background preloading if available_files is populated and no preload in progress
                     if self.preload_rx.is_none() {
@@ -1226,7 +1282,9 @@ impl RadarApp {
             _ => {
                 let sweep_idx = self.find_sweep_for_product(self.selected_product)
                     .unwrap_or(self.selected_elevation);
-                (self.selected_product, file.sweeps.get(sweep_idx))
+                // For super-res products, use the base product for moment lookup
+                let render_prod = self.selected_product.base_product();
+                (render_prod, file.sweeps.get(sweep_idx))
             }
         };
 
@@ -1284,7 +1342,7 @@ impl RadarApp {
                 _ => {
                     let sweep_idx = self.find_sweep_for_product(dp)
                         .unwrap_or(self.selected_elevation);
-                    (dp, file.sweeps.get(sweep_idx))
+                    (dp.base_product(), file.sweeps.get(sweep_idx))
                 }
             };
 
@@ -1707,6 +1765,9 @@ impl RadarApp {
             return;
         }
 
+        // Get cursor position for hover highlight
+        let cursor_screen = ui.ctx().input(|i| i.pointer.hover_pos());
+
         for site in sites::RADAR_SITES.iter() {
             let (px, py) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
             let pos = egui::pos2(rect.left() + px as f32, rect.top() + py as f32);
@@ -1716,22 +1777,49 @@ impl RadarApp {
             }
 
             let is_selected = site.id == self.selected_station;
+            let is_hovered = cursor_screen
+                .map(|c| c.distance(pos) < 15.0)
+                .unwrap_or(false);
+
             let color = if is_selected {
                 egui::Color32::from_rgb(255, 255, 0)
+            } else if is_hovered {
+                egui::Color32::from_rgb(100, 200, 255)
             } else {
                 egui::Color32::from_rgb(200, 200, 200)
             };
 
-            let radius = if is_selected { 5.0 } else { 3.0 };
+            let radius = if is_selected {
+                6.0
+            } else if is_hovered {
+                5.5
+            } else {
+                4.0
+            };
+
+            // Draw outer glow ring on hover for clickability hint
+            if is_hovered && !is_selected {
+                ui.painter().circle_stroke(
+                    pos,
+                    8.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgba_premultiplied(100, 200, 255, 120)),
+                );
+            }
+
             ui.painter().circle_filled(pos, radius, color);
 
-            if self.map_view.zoom >= 7.0 || is_selected {
+            if self.map_view.zoom >= 7.0 || is_selected || is_hovered {
+                let label_color = if is_hovered && !is_selected {
+                    egui::Color32::from_rgb(100, 200, 255)
+                } else {
+                    color
+                };
                 ui.painter().text(
-                    pos + egui::vec2(6.0, -6.0),
+                    pos + egui::vec2(8.0, -8.0),
                     egui::Align2::LEFT_BOTTOM,
                     site.id,
-                    egui::FontId::proportional(10.0),
-                    color,
+                    egui::FontId::proportional(if is_hovered { 12.0 } else { 10.0 }),
+                    label_color,
                 );
             }
         }
@@ -1771,14 +1859,26 @@ impl RadarApp {
             if i.key_pressed(egui::Key::ArrowRight) {
                 if let Some(idx) = products.iter().position(|&p| p == self.selected_product) {
                     let next = (idx + 1) % products.len();
-                    self.selected_product = products[next];
+                    let new_product = products[next];
+                    if new_product == RadarProduct::StormRelativeVelocity
+                        && self.selected_product != RadarProduct::StormRelativeVelocity
+                    {
+                        self.estimate_storm_motion();
+                    }
+                    self.selected_product = new_product;
                     self.needs_render = true;
                 }
             }
             if i.key_pressed(egui::Key::ArrowLeft) {
                 if let Some(idx) = products.iter().position(|&p| p == self.selected_product) {
                     let prev = if idx == 0 { products.len() - 1 } else { idx - 1 };
-                    self.selected_product = products[prev];
+                    let new_product = products[prev];
+                    if new_product == RadarProduct::StormRelativeVelocity
+                        && self.selected_product != RadarProduct::StormRelativeVelocity
+                    {
+                        self.estimate_storm_motion();
+                    }
+                    self.selected_product = new_product;
                     self.needs_render = true;
                 }
             }
@@ -1908,7 +2008,14 @@ impl RadarApp {
         if let Some(idx) = num_product {
             let products = RadarProduct::all_products();
             if idx < products.len() {
-                self.selected_product = products[idx];
+                let new_product = products[idx];
+                // Auto-estimate storm motion when switching to SRV
+                if new_product == RadarProduct::StormRelativeVelocity
+                    && self.selected_product != RadarProduct::StormRelativeVelocity
+                {
+                    self.estimate_storm_motion();
+                }
+                self.selected_product = new_product;
                 self.needs_render = true;
             }
         }
@@ -1971,7 +2078,7 @@ impl RadarApp {
                     for site in sites::RADAR_SITES.iter() {
                         let (sx, sy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
                         let dist = ((click_x - sx).powi(2) + (click_y - sy).powi(2)).sqrt();
-                        if dist < 10.0 {
+                        if dist < 15.0 {
                             self.select_station(site.id);
                             break;
                         }
@@ -1999,9 +2106,10 @@ impl RadarApp {
             None => return,
         };
 
-        let color_table = crate::render::ColorTable::for_product_preset(self.selected_product, self.color_preset);
+        let render_prod = self.selected_product.base_product();
+        let color_table = crate::render::ColorTable::for_product_preset(render_prod, self.color_preset);
         let result = crate::render::CrossSectionRenderer::render_cross_section(
-            file, self.selected_product, &color_table, site, start, end, 800, 300,
+            file, render_prod, &color_table, site, start, end, 800, 300,
         );
 
         // Texture will be created in the update loop since we need ctx
@@ -2031,7 +2139,10 @@ impl RadarApp {
             return;
         }
 
-        // Find the sweep for this product
+        // For super-res variants, use the base product for moment data lookup
+        let lookup_product = product.base_product();
+
+        // Find the sweep for this product (respects super-res filtering)
         let sweep_idx = match self.find_sweep_for_product_in(file, product) {
             Some(i) => i,
             None => return,
@@ -2041,7 +2152,7 @@ impl RadarApp {
         let readout = match crate::render::data_readout::lookup_cursor_data(
             self.cursor_lat, self.cursor_lon,
             site.lat, site.lon,
-            file, sweep_idx, product,
+            file, sweep_idx, lookup_product,
         ) {
             Some(r) => r,
             None => return,
@@ -2104,21 +2215,18 @@ impl RadarApp {
 
     /// Find the best sweep for a given product in a specific file (non-mutating helper).
     fn find_sweep_for_product_in(&self, file: &Level2File, product: RadarProduct) -> Option<usize> {
+        let base = product.base_product();
+        let require_super_res = product.is_super_res();
+
         // First, try the selected elevation
         if let Some(sweep) = file.sweeps.get(self.selected_elevation) {
-            let has_product = sweep.radials.iter().any(|r| {
-                r.moments.iter().any(|m| m.product == product)
-            });
-            if has_product {
+            if Self::sweep_matches(sweep, base, require_super_res) {
                 return Some(self.selected_elevation);
             }
         }
         // Fallback to lowest elevation with this product
         for (i, sweep) in file.sweeps.iter().enumerate() {
-            let has_product = sweep.radials.iter().any(|r| {
-                r.moments.iter().any(|m| m.product == product)
-            });
-            if has_product {
+            if Self::sweep_matches(sweep, base, require_super_res) {
                 return Some(i);
             }
         }
@@ -2280,9 +2388,9 @@ impl eframe::App for RadarApp {
         let frame_start = Instant::now();
         if let Some(last) = self.perf.last_frame_start {
             let dt = last.elapsed();
-            self.perf.frame_times.push(dt);
+            self.perf.frame_times.push_back(dt);
             if self.perf.frame_times.len() > 60 {
-                self.perf.frame_times.remove(0);
+                self.perf.frame_times.pop_front();
             }
             if !self.perf.frame_times.is_empty() {
                 let avg: f64 = self.perf.frame_times.iter()
@@ -2307,25 +2415,56 @@ impl eframe::App for RadarApp {
         }
         // Check for sounding results
         self.check_sounding_result(ctx);
-        // Sync preload cache → national view thumbnails
+        // Sync preload cache → national view thumbnails (throttled to once per 2 seconds)
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref engine) = self.preload_engine {
-            let cache = engine.get_cache();
-            if let Ok(guard) = cache.read() {
-                for station_id in guard.stations_loaded() {
-                    if self.national_view.loaded_count() < 200 {
-                        if let Some(cached) = guard.get(&station_id) {
-                            if let Some(ref pixels) = cached.thumbnail_pixels {
-                                self.national_view.update_thumbnail(ctx, &station_id, pixels);
+        {
+            let now = Instant::now();
+            let should_sync = self.last_preload_sync
+                .map(|t| now.duration_since(t) > Duration::from_secs(2))
+                .unwrap_or(true);
+            if should_sync {
+                self.last_preload_sync = Some(now);
+                if let Some(ref engine) = self.preload_engine {
+                    let cache = engine.get_cache();
+                    if let Ok(guard) = cache.try_read() {
+                        let loaded = guard.stations_loaded();
+                        if loaded.len() > self.national_view.loaded_count() {
+                            for station_id in &loaded {
+                                if let Some(cached) = guard.get(station_id) {
+                                    if let Some(ref pixels) = cached.thumbnail_pixels {
+                                        self.national_view.update_thumbnail(ctx, station_id, pixels);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Periodically refresh alerts and re-trigger preload
+                    if self.show_warnings && self.alert_fetcher.should_refresh() {
+                        let alerts = self.alert_fetcher.get_alerts();
+                        engine.preload_active_weather(&alerts);
+                    }
+
+                    // When zoomed to single-radar view, preload current + neighbors within ~300km
+                    if self.map_view.zoom >= 7.0 {
+                        if let Some(site) = sites::find_site(&self.selected_station) {
+                            let neighbors = sites::find_nearest_sites(site.lat, site.lon, 6);
+                            let mut to_preload = Vec::new();
+                            let cache_ref = engine.get_cache();
+                            if let Ok(guard) = cache_ref.try_read() {
+                                for neighbor in &neighbors {
+                                    let dist = sites::haversine_km(site.lat, site.lon, neighbor.lat, neighbor.lon);
+                                    if dist <= 300.0 && !guard.has(neighbor.id) {
+                                        to_preload.push(neighbor.id.to_string());
+                                    }
+                                }
+                            }
+                            if !to_preload.is_empty() {
+                                log::info!("Preloading {} neighbors of {}", to_preload.len(), self.selected_station);
+                                engine.start_preload(to_preload);
                             }
                         }
                     }
                 }
-            }
-            // Periodically refresh alerts and re-trigger preload
-            if self.show_warnings && self.alert_fetcher.should_refresh() {
-                let alerts = self.alert_fetcher.get_alerts();
-                engine.preload_active_weather(&alerts);
             }
         }
         if self.pending_anim_prerender {
@@ -2453,8 +2592,10 @@ impl eframe::App for RadarApp {
                         self.tile_manager.request_tile(*key);
                     }
                     self.draw_quad_overlay(ui, available_rect);
+                    self.draw_radar_sites(ui, available_rect);
                 } else if self.dual_pane {
                     self.draw_dual_pane(ui, available_rect);
+                    self.draw_radar_sites(ui, available_rect);
                 } else {
                     self.draw_map(ui, available_rect);
                     self.draw_radar_overlay(ui, available_rect);
@@ -2479,17 +2620,17 @@ impl eframe::App for RadarApp {
                     let cursor_pos = response.hover_pos();
                     if let Some(site) = self.hover_preview.detect_hover(cursor_pos, &self.map_view, available_rect) {
                         let site_id = site.id.to_string();
-                        let thumbnail = {
+                        let thumbnail: Option<Vec<u8>> = {
                             #[cfg(not(target_arch = "wasm32"))]
                             {
                                 self.preload_engine.as_ref().and_then(|e| {
                                     let cache = e.get_cache();
-                                    let guard = cache.read().ok()?;
+                                    let guard = cache.try_read().ok()?;
                                     guard.get(&site_id).and_then(|c| c.thumbnail_pixels.clone())
                                 })
                             }
                             #[cfg(target_arch = "wasm32")]
-                            { None::<Vec<u8>> }
+                            { None }
                         };
                         if let Some(pos) = cursor_pos {
                             self.hover_preview.draw_preview(
@@ -2506,9 +2647,9 @@ impl eframe::App for RadarApp {
                             #[cfg(not(target_arch = "wasm32"))]
                             {
                                 self.preload_engine.as_ref()
-                                    .map(|e| {
+                                    .and_then(|e| {
                                         let cache = e.get_cache();
-                                        cache.read().map(|g| g.stations_loaded()).unwrap_or_default()
+                                        cache.try_read().ok().map(|g| g.stations_loaded())
                                     })
                                     .unwrap_or_default()
                             }
@@ -2619,7 +2760,15 @@ impl eframe::App for RadarApp {
             }
         }
 
-        ctx.request_repaint();
+        // Only request continuous repaint when actually needed
+        if self.anim_playing || self.anim_loading || self.fetcher.is_fetching()
+            || self.sounding_fetcher.is_fetching()
+        {
+            ctx.request_repaint();
+        } else {
+            // Otherwise repaint at a low rate for background updates
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 }
 
@@ -2715,21 +2864,34 @@ impl RadarApp {
 
     fn check_sounding_result(&mut self, ctx: &egui::Context) {
         // Only check when we don't already have a texture and a fetch was started
-        if self.sounding_texture.is_some() {
+        if self.sounding_texture.is_some() || !self.sounding_pending {
             return;
         }
+
+        // If the fetch is still in progress, nothing to do yet.
+        if self.sounding_fetcher.is_fetching() {
+            return;
+        }
+
+        // Fetch is complete. Check if we got a profile.
         if let Some(profile) = self.sounding_fetcher.profile() {
             // Clear the result so we don't re-render every frame
             *self.sounding_fetcher.result.lock().unwrap() = None;
             // Render Skew-T diagram
-            let pixels = crate::render::skewt::SkewTRenderer::render(&profile, 600, 800);
-            let image = egui::ColorImage::from_rgba_unmultiplied([600, 800], &pixels);
+            let pixels = crate::render::skewt::SkewTRenderer::render(&profile, 900, 700);
+            let image = egui::ColorImage::from_rgba_unmultiplied([900, 700], &pixels);
             self.sounding_texture = Some(ctx.load_texture(
                 "sounding", image, egui::TextureOptions::LINEAR,
             ));
             self.sounding_pending = false;
             log::info!("Sounding loaded: CAPE={:.0} CIN={:.0} SRH={:.0}",
-                profile.cape, profile.cin, profile.srh_0_1);
+                profile.params.sb_cape, profile.params.sb_cin, profile.params.srh_01);
+        } else {
+            // Fetch completed but no data — stop the continuous repaint loop.
+            // The sounding window will show the "no data" message.
+            // Keep sounding_pending true so the window stays open, but
+            // we no longer need continuous repainting.
+            // (sounding_pending will be cleared when user closes the window)
         }
     }
 }

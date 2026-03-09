@@ -43,8 +43,8 @@ pub struct ColorEntry {
 impl ColorTable {
     pub fn for_product(product: RadarProduct) -> Self {
         match product {
-            RadarProduct::Reflectivity => Self::reflectivity_table(),
-            RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => Self::velocity_table(),
+            RadarProduct::Reflectivity | RadarProduct::SuperResReflectivity => Self::reflectivity_table(),
+            RadarProduct::Velocity | RadarProduct::StormRelativeVelocity | RadarProduct::SuperResVelocity => Self::velocity_table(),
             RadarProduct::SpectrumWidth => Self::spectrum_width_table(),
             RadarProduct::DifferentialReflectivity => Self::zdr_table(),
             RadarProduct::CorrelationCoefficient => Self::cc_table(),
@@ -58,6 +58,13 @@ impl ColorTable {
     pub fn color_for_value(&self, value: f32) -> [u8; 4] {
         if value.is_nan() || value < self.min_value {
             return [0, 0, 0, 0]; // transparent
+        }
+
+        // Clamp to last entry if value exceeds table max
+        if let Some(last) = self.entries.last() {
+            if value >= last.value {
+                return [last.r, last.g, last.b, last.a];
+            }
         }
 
         // Find the two entries that bracket this value

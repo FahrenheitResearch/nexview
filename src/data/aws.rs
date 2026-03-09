@@ -261,10 +261,19 @@ impl NexradFetcher {
 
     /// Download a specific NEXRAD file
     pub fn download_file(&self, key: &str) {
+        {
+            let mut fetching = self.fetching.lock().unwrap();
+            if *fetching {
+                return;
+            }
+            *fetching = true;
+        }
+
         let http = Arc::clone(&self.http);
         let data = Arc::clone(&self.downloaded_data);
         let progress = Arc::clone(&self.download_progress);
         let dl_duration = Arc::clone(&self.download_duration);
+        let fetching = Arc::clone(&self.fetching);
         let key = key.to_string();
 
         let display_name = key.rsplit('/').next().unwrap_or(&key).to_string();
@@ -297,6 +306,7 @@ impl NexradFetcher {
                     *progress.lock().unwrap() = Some(format!("Error: {}", e));
                 }
             }
+            *fetching.lock().unwrap() = false;
         });
     }
 

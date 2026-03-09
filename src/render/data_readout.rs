@@ -50,7 +50,7 @@ pub fn format_value(value: f32, product: RadarProduct) -> String {
         RadarProduct::CorrelationCoefficient => format!("{:.3} {}", value, unit).trim().to_string(),
         RadarProduct::SpecificDiffPhase => format!("{:.2} {}", value, unit),
         RadarProduct::DifferentialReflectivity => format!("{:.2} {}", value, unit),
-        RadarProduct::Velocity | RadarProduct::SpectrumWidth => {
+        RadarProduct::Velocity | RadarProduct::SpectrumWidth | RadarProduct::SuperResVelocity | RadarProduct::StormRelativeVelocity => {
             // Convert m/s to knots for display
             let kts = value * 1.94384;
             format!("{:.1} {}", kts, unit)

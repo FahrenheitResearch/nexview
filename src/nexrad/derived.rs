@@ -32,7 +32,17 @@ impl DerivedProducts {
         });
 
         // Use the lowest sweep as the template
-        let template = ref_sweeps.first().expect("No reflectivity sweeps found");
+        let template = match ref_sweeps.first() {
+            Some(t) => t,
+            None => {
+                return Level2Sweep {
+                    elevation_number: 0,
+                    elevation_angle: 0.0,
+                    nyquist_velocity: None,
+                    radials: Vec::new(),
+                };
+            }
+        };
         let template_radials = &template.radials;
 
         let mut out_radials: Vec<RadialData> = Vec::with_capacity(template_radials.len());
@@ -59,7 +69,7 @@ impl DerivedProducts {
                     if let Some(nr) = nearest {
                         if let Some(ref_m) = nr.moments.iter().find(|m| m.product == RadarProduct::Reflectivity) {
                             // Map gate index using this sweep's gate geometry
-                            let gi = range_to_gate_index(range_m, ref_m.first_gate_range, ref_m.gate_size);
+                            let gi = range_to_gate_index(range_m, ref_m.first_gate_range, ref_m.gate_size, ref_m.gate_count);
                             if let Some(&dbz) = gi.and_then(|i| ref_m.data.get(i)) {
                                 if !dbz.is_nan() && dbz >= 0.0 {
                                     let elev_rad = (nr.elevation as f64).to_radians();
@@ -102,6 +112,7 @@ impl DerivedProducts {
                 azimuth: radial.azimuth,
                 elevation: radial.elevation,
                 azimuth_spacing: radial.azimuth_spacing,
+                nyquist_velocity: radial.nyquist_velocity,
                 moments: vec![MomentData {
                     product: RadarProduct::VIL,
                     gate_count: num_gates as u16,
@@ -115,6 +126,7 @@ impl DerivedProducts {
         Level2Sweep {
             elevation_number: 0,
             elevation_angle: 0.0,
+            nyquist_velocity: None,
             radials: out_radials,
         }
     }
@@ -140,7 +152,17 @@ impl DerivedProducts {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let template = ref_sweeps.first().expect("No reflectivity sweeps found");
+        let template = match ref_sweeps.first() {
+            Some(t) => t,
+            None => {
+                return Level2Sweep {
+                    elevation_number: 0,
+                    elevation_angle: 0.0,
+                    nyquist_velocity: None,
+                    radials: Vec::new(),
+                };
+            }
+        };
         let template_radials = &template.radials;
 
         let mut out_radials: Vec<RadialData> = Vec::with_capacity(template_radials.len());
@@ -166,7 +188,7 @@ impl DerivedProducts {
                     let nearest = find_nearest_radial(sweep, radial.azimuth);
                     if let Some(nr) = nearest {
                         if let Some(ref_m) = nr.moments.iter().find(|m| m.product == RadarProduct::Reflectivity) {
-                            let gi = range_to_gate_index(range_m, ref_m.first_gate_range, ref_m.gate_size);
+                            let gi = range_to_gate_index(range_m, ref_m.first_gate_range, ref_m.gate_size, ref_m.gate_count);
                             if let Some(&dbz) = gi.and_then(|i| ref_m.data.get(i)) {
                                 if !dbz.is_nan() && dbz >= threshold_dbz {
                                     let elev_rad = (nr.elevation as f64).to_radians();
@@ -185,6 +207,7 @@ impl DerivedProducts {
                 azimuth: radial.azimuth,
                 elevation: radial.elevation,
                 azimuth_spacing: radial.azimuth_spacing,
+                nyquist_velocity: radial.nyquist_velocity,
                 moments: vec![MomentData {
                     product: RadarProduct::EchoTops,
                     gate_count: num_gates as u16,
@@ -198,6 +221,7 @@ impl DerivedProducts {
         Level2Sweep {
             elevation_number: 0,
             elevation_angle: 0.0,
+            nyquist_velocity: None,
             radials: out_radials,
         }
     }
@@ -234,7 +258,7 @@ fn find_nearest_radial<'a>(sweep: &'a Level2Sweep, target_az: f32) -> Option<&'a
 
 /// Convert a range in meters to a gate index for a given moment geometry.
 /// Returns None if the range falls outside the data.
-fn range_to_gate_index(range_m: f64, first_gate_range: u16, gate_size: u16) -> Option<usize> {
+fn range_to_gate_index(range_m: f64, first_gate_range: u16, gate_size: u16, gate_count: u16) -> Option<usize> {
     if gate_size == 0 {
         return None;
     }
@@ -243,5 +267,8 @@ fn range_to_gate_index(range_m: f64, first_gate_range: u16, gate_size: u16) -> O
         return None;
     }
     let idx = (offset / gate_size as f64).round() as usize;
+    if idx >= gate_count as usize {
+        return None;
+    }
     Some(idx)
 }

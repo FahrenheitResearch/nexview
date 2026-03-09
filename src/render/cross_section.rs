@@ -115,10 +115,10 @@ impl CrossSectionRenderer {
                 }
 
                 let value = moment.data[gate_idx as usize];
-                if value.is_nan() || value < color_table.min_value || value > color_table.max_value
-                {
+                if value.is_nan() || value < color_table.min_value {
                     continue;
                 }
+                let value = value.min(color_table.max_value);
 
                 // Beam altitude using standard atmospheric refraction formula:
                 //   h = sqrt(r² + Re'² + 2·r·Re'·sin(θ)) − Re'

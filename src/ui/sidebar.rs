@@ -73,83 +73,105 @@ impl CollapsibleSidebar {
     }
 
     fn draw_expanded(app: &mut RadarApp, ui: &mut egui::Ui) {
-        // Icon rail on the left, content on the right
-        ui.horizontal(|ui| {
-            // Narrow icon rail
-            ui.vertical(|ui| {
-                ui.set_width(36.0);
-                ui.add_space(8.0);
+        // Use the full available height for the sidebar layout
+        let available = ui.available_rect_before_wrap();
+        let rail_width = 36.0;
+        let separator_width = 6.0;
 
-                let sections = [
-                    (SidebarSection::Station, "S", "Stations"),
-                    (SidebarSection::Date, "D", "Date / Archive"),
-                    (SidebarSection::Overlays, "O", "Overlays"),
-                    (SidebarSection::Tools, "T", "Tools"),
-                    (SidebarSection::Performance, "P", "Performance"),
-                ];
+        // Icon rail: fixed-width strip on the left, full height
+        let rail_rect = egui::Rect::from_min_size(
+            available.min,
+            egui::vec2(rail_width, available.height()),
+        );
+        let mut rail_ui = ui.new_child(egui::UiBuilder::new().max_rect(rail_rect));
+        rail_ui.vertical(|ui| {
+            ui.set_width(rail_width);
+            ui.add_space(8.0);
 
-                for (section, icon, tooltip) in sections {
-                    let is_active = app.sidebar_section == section;
-                    let btn = egui::Button::new(
-                        egui::RichText::new(icon).size(16.0).strong(),
-                    )
-                    .min_size(egui::vec2(32.0, 32.0))
-                    .fill(if is_active {
-                        egui::Color32::from_rgb(0, 100, 120)
+            let sections = [
+                (SidebarSection::Station, "S", "Stations"),
+                (SidebarSection::Date, "D", "Date / Archive"),
+                (SidebarSection::Overlays, "O", "Overlays"),
+                (SidebarSection::Tools, "T", "Tools"),
+                (SidebarSection::Performance, "P", "Performance"),
+            ];
+
+            for (section, icon, tooltip) in sections {
+                let is_active = app.sidebar_section == section;
+                let btn = egui::Button::new(
+                    egui::RichText::new(icon).size(16.0).strong(),
+                )
+                .min_size(egui::vec2(32.0, 32.0))
+                .fill(if is_active {
+                    egui::Color32::from_rgb(0, 100, 120)
+                } else {
+                    egui::Color32::TRANSPARENT
+                });
+
+                let response = ui.add(btn);
+                if response.clicked() {
+                    if app.sidebar_section == section {
+                        app.sidebar_expanded = false;
                     } else {
-                        egui::Color32::TRANSPARENT
-                    });
-
-                    let response = ui.add(btn);
-                    if response.clicked() {
-                        if app.sidebar_section == section {
-                            app.sidebar_expanded = false;
-                        } else {
-                            app.sidebar_section = section;
-                        }
+                        app.sidebar_section = section;
                     }
-                    if response.hovered() {
-                        response.on_hover_text(tooltip);
-                    }
-                    ui.add_space(4.0);
                 }
-            });
+                if response.hovered() {
+                    response.on_hover_text(tooltip);
+                }
+                ui.add_space(4.0);
+            }
+        });
 
+        // Separator line between rail and content
+        let sep_x = available.left() + rail_width;
+        ui.painter().line_segment(
+            [egui::pos2(sep_x, available.top()), egui::pos2(sep_x, available.bottom())],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+        );
+
+        // Content area: remaining width, full height
+        let content_rect = egui::Rect::from_min_max(
+            egui::pos2(available.left() + rail_width + separator_width, available.top()),
+            available.max,
+        );
+        let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+        content_ui.vertical(|ui| {
+            // Header with section name and collapse button
+            ui.horizontal(|ui| {
+                let section_name = match app.sidebar_section {
+                    SidebarSection::Station => "Stations",
+                    SidebarSection::Date => "Date / Archive",
+                    SidebarSection::Overlays => "Overlays",
+                    SidebarSection::Tools => "Tools",
+                    SidebarSection::Performance => "Performance",
+                };
+                ui.strong(section_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("\u{25C0}").clicked() {
+                        app.sidebar_expanded = false;
+                    }
+                });
+            });
             ui.separator();
 
-            // Content area
-            ui.vertical(|ui| {
-                // Header with section name and collapse button
-                ui.horizontal(|ui| {
-                    let section_name = match app.sidebar_section {
-                        SidebarSection::Station => "Stations",
-                        SidebarSection::Date => "Date / Archive",
-                        SidebarSection::Overlays => "Overlays",
-                        SidebarSection::Tools => "Tools",
-                        SidebarSection::Performance => "Performance",
-                    };
-                    ui.strong(section_name);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("◀").clicked() {
-                            app.sidebar_expanded = false;
-                        }
-                    });
+            // Single scroll area for all content, using remaining vertical space
+            egui::ScrollArea::vertical()
+                .id_salt("sidebar_content")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    match app.sidebar_section {
+                        SidebarSection::Station => Self::station_section(app, ui),
+                        SidebarSection::Date => Self::date_section(app, ui),
+                        SidebarSection::Overlays => Self::overlays_section(app, ui),
+                        SidebarSection::Tools => Self::tools_section(app, ui),
+                        SidebarSection::Performance => Self::perf_section(app, ui),
+                    }
                 });
-                ui.separator();
-
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_content")
-                    .show(ui, |ui| {
-                        match app.sidebar_section {
-                            SidebarSection::Station => Self::station_section(app, ui),
-                            SidebarSection::Date => Self::date_section(app, ui),
-                            SidebarSection::Overlays => Self::overlays_section(app, ui),
-                            SidebarSection::Tools => Self::tools_section(app, ui),
-                            SidebarSection::Performance => Self::perf_section(app, ui),
-                        }
-                    });
-            });
         });
+
+        // Advance the parent UI cursor past the full area we used
+        ui.allocate_rect(available, egui::Sense::hover());
     }
 
     // ---- Station section ----
@@ -404,6 +426,11 @@ impl CollapsibleSidebar {
                 .selectable_label(selected, product.display_name())
                 .clicked()
             {
+                if *product == RadarProduct::StormRelativeVelocity
+                    && app.selected_product != RadarProduct::StormRelativeVelocity
+                {
+                    app.estimate_storm_motion();
+                }
                 app.selected_product = *product;
                 app.needs_render = true;
             }
@@ -784,7 +811,7 @@ impl CollapsibleSidebar {
                     egui::pos2(rect.left() + bar_width, y_end),
                 ),
                 0.0,
-                egui::Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3]),
+                egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]),
             );
         }
 

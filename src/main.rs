@@ -8,6 +8,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
             .with_title("NexView - Weather Radar Viewer"),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 

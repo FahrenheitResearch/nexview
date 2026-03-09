@@ -29,7 +29,7 @@ pub fn export_animation_gif(
         .map_err(|e| format!("Failed to set repeat: {}", e))?;
 
     // GIF delay is in centiseconds (10ms units)
-    let delay_cs = delay_ms / 10;
+    let delay_cs = (delay_ms + 5) / 10;
 
     for (i, frame) in frames.iter().enumerate() {
         if frame.width() as u16 != width || frame.height() as u16 != height {

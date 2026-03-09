@@ -1,5 +1,22 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[cfg(feature = "local-maps")]
+static RUSTMAPS_RENDERER: OnceLock<rustmaps::render::TileRenderer> = OnceLock::new();
+
+#[cfg(feature = "local-maps")]
+fn get_rustmaps_renderer() -> &'static rustmaps::render::TileRenderer {
+    RUSTMAPS_RENDERER.get_or_init(|| {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let data_dir = exe_dir
+            .map(|d| d.join("rustmaps_data"))
+            .filter(|d| d.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Users\drew\rustmaps\data"));
+        rustmaps::load_renderer(&data_dir).expect("Failed to load rustmaps geodata")
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TileProvider {
@@ -7,6 +24,8 @@ pub enum TileProvider {
     Dark,
     Topographic,
     Satellite,
+    #[cfg(feature = "local-maps")]
+    Weather,
 }
 
 impl TileProvider {
@@ -16,11 +35,20 @@ impl TileProvider {
             Self::Dark => "Dark",
             Self::Topographic => "Topographic",
             Self::Satellite => "Satellite",
+            #[cfg(feature = "local-maps")]
+            Self::Weather => "Weather (Dark)",
         }
     }
 
     pub fn all() -> &'static [TileProvider] {
-        &[Self::OpenStreetMap, Self::Dark, Self::Topographic, Self::Satellite]
+        &[
+            Self::OpenStreetMap,
+            Self::Dark,
+            Self::Topographic,
+            Self::Satellite,
+            #[cfg(feature = "local-maps")]
+            Self::Weather,
+        ]
     }
 
     fn url(&self, z: u8, x: u32, y: u32) -> String {
@@ -29,13 +57,28 @@ impl TileProvider {
             Self::Dark => format!("https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"),
             Self::Topographic => format!("https://tile.opentopomap.org/{z}/{x}/{y}.png"),
             Self::Satellite => format!("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+            #[cfg(feature = "local-maps")]
+            Self::Weather => String::new(), // Rendered locally, no URL needed
         }
     }
 }
 
+impl Default for TileProvider {
+    fn default() -> Self {
+        #[cfg(feature = "local-maps")]
+        { Self::Weather }
+        #[cfg(not(feature = "local-maps"))]
+        { Self::Dark }
+    }
+}
+
+const TILE_CACHE_MAX: usize = 500;
+const TILE_CACHE_EVICT_TO: usize = 400;
+
 /// Manages downloading and caching of map tiles
 pub struct MapTileManager {
     cache: Arc<Mutex<HashMap<TileKey, TileData>>>,
+    insertion_order: Arc<Mutex<VecDeque<TileKey>>>,
     pending: Arc<Mutex<Vec<TileKey>>>,
     runtime: tokio::runtime::Handle,
     provider: Arc<Mutex<TileProvider>>,
@@ -265,9 +308,10 @@ impl MapTileManager {
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),
+            insertion_order: Arc::new(Mutex::new(VecDeque::new())),
             pending: Arc::new(Mutex::new(Vec::new())),
             runtime,
-            provider: Arc::new(Mutex::new(TileProvider::OpenStreetMap)),
+            provider: Arc::new(Mutex::new(TileProvider::default())),
         }
     }
 
@@ -276,11 +320,20 @@ impl MapTileManager {
     }
 
     pub fn set_provider(&self, provider: TileProvider) {
-        let mut current = self.provider.lock().unwrap();
-        if *current != provider {
-            *current = provider;
+        let changed = {
+            let mut current = self.provider.lock().unwrap();
+            if *current != provider {
+                *current = provider;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
             // Clear cache — new provider means new tiles
+            // Lock cache before pending to match request_tile ordering
             self.cache.lock().unwrap().clear();
+            self.insertion_order.lock().unwrap().clear();
             self.pending.lock().unwrap().clear();
         }
     }
@@ -307,14 +360,31 @@ impl MapTileManager {
         }
 
         let cache = Arc::clone(&self.cache);
+        let insertion_order = Arc::clone(&self.insertion_order);
         let pending = Arc::clone(&self.pending);
         let provider = *self.provider.lock().unwrap();
+
+        #[cfg(feature = "local-maps")]
+        if provider == TileProvider::Weather {
+            self.runtime.spawn_blocking(move || {
+                let renderer = get_rustmaps_renderer();
+                let pixels_buf = renderer.render_tile(key.z, key.x, key.y);
+                let tile = TileData {
+                    width: 256,
+                    height: 256,
+                    pixels: pixels_buf.data,
+                };
+                Self::insert_with_eviction(&cache, &insertion_order, key, tile);
+                pending.lock().unwrap().retain(|k| k != &key);
+            });
+            return;
+        }
 
         self.runtime.spawn(async move {
             let url = provider.url(key.z, key.x, key.y);
 
             let client = reqwest::Client::builder()
-                .user_agent("NexView/0.1 Weather Radar Viewer")
+                .user_agent("NexView/1.1 Weather Radar Viewer")
                 .build();
 
             let client = match client {
@@ -335,7 +405,7 @@ impl MapTileManager {
                                 height: rgba.height(),
                                 pixels: rgba.into_raw(),
                             };
-                            cache.lock().unwrap().insert(key, tile);
+                            Self::insert_with_eviction(&cache, &insertion_order, key, tile);
                         }
                     }
                 }
@@ -346,6 +416,27 @@ impl MapTileManager {
 
             pending.lock().unwrap().retain(|k| k != &key);
         });
+    }
+
+    fn insert_with_eviction(
+        cache: &Mutex<HashMap<TileKey, TileData>>,
+        insertion_order: &Mutex<VecDeque<TileKey>>,
+        key: TileKey,
+        tile: TileData,
+    ) {
+        let mut c = cache.lock().unwrap();
+        let mut order = insertion_order.lock().unwrap();
+        c.insert(key, tile);
+        order.push_back(key);
+        if c.len() > TILE_CACHE_MAX {
+            while c.len() > TILE_CACHE_EVICT_TO {
+                if let Some(old_key) = order.pop_front() {
+                    c.remove(&old_key);
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn cache_size(&self) -> usize {

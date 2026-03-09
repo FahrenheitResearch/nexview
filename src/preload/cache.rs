@@ -3,6 +3,8 @@ use std::time::Instant;
 
 use crate::nexrad::Level2File;
 
+const SITE_CACHE_MAX: usize = 20;
+
 /// A single cached radar site with parsed data and optional thumbnail
 pub struct CachedSite {
     pub station_id: String,
@@ -30,9 +32,21 @@ impl SiteCache {
         self.cache.get(&station_id.to_uppercase())
     }
 
-    /// Insert or replace a cached site
+    /// Insert or replace a cached site, evicting the oldest entry if full
     pub fn insert(&mut self, entry: CachedSite) {
-        self.cache.insert(entry.station_id.to_uppercase(), entry);
+        let key = entry.station_id.to_uppercase();
+        if !self.cache.contains_key(&key) && self.cache.len() >= SITE_CACHE_MAX {
+            // Evict the oldest entry by fetched_at
+            if let Some(oldest_key) = self
+                .cache
+                .iter()
+                .min_by_key(|(_, v)| v.fetched_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.cache.remove(&oldest_key);
+            }
+        }
+        self.cache.insert(key, entry);
     }
 
     /// Check whether a station is already cached

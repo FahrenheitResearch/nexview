@@ -57,9 +57,9 @@ jobs:
             <key>CFBundleIdentifier</key>
             <string>com.fahrenheitresearch.nexview</string>
             <key>CFBundleVersion</key>
-            <string>0.5.0</string>
+            <string>1.1.0</string>
             <key>CFBundleShortVersionString</key>
-            <string>0.5.0</string>
+            <string>1.1.0</string>
             <key>CFBundleExecutable</key>
             <string>nexview</string>
             <key>CFBundlePackageType</key>
@@ -71,6 +71,8 @@ jobs:
           </dict>
           </plist>
           PLIST
+      - name: Sign App Bundle
+        run: codesign --force --deep -s - "NexView.app"
       - name: Package DMG
         run: |
           hdiutil create -volname "NexView" -srcfolder "NexView.app" -ov -format UDZO NexView-macOS-Intel.dmg
@@ -104,9 +106,9 @@ jobs:
             <key>CFBundleIdentifier</key>
             <string>com.fahrenheitresearch.nexview</string>
             <key>CFBundleVersion</key>
-            <string>0.5.0</string>
+            <string>1.1.0</string>
             <key>CFBundleShortVersionString</key>
-            <string>0.5.0</string>
+            <string>1.1.0</string>
             <key>CFBundleExecutable</key>
             <string>nexview</string>
             <key>CFBundlePackageType</key>
@@ -118,6 +120,8 @@ jobs:
           </dict>
           </plist>
           PLIST
+      - name: Sign App Bundle
+        run: codesign --force --deep -s - "NexView.app"
       - name: Package DMG
         run: |
           hdiutil create -volname "NexView" -srcfolder "NexView.app" -ov -format UDZO NexView-macOS-AppleSilicon.dmg
@@ -158,7 +162,38 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body: |
+            ## NexView v1.1.0
+
+            ### Bug Fixes (18 fixes)
+            - **Fixed critical SRV (Storm Relative Velocity) computation** - was subtracting knots from m/s, off by ~1.94x
+            - **Fixed crash on volume scans without reflectivity data** - graceful handling instead of panic
+            - **Fixed GPU rendering** - now defaults to wgpu backend with GPU enabled by default
+            - **Fixed unbounded memory growth** - map tile cache (500 max) and site cache (20 max) with LRU eviction
+            - **Fixed potential deadlock** in map tile provider switching
+            - **Fixed cross-section clipping** values above color table max
+            - **Fixed color legend** using premultiplied alpha incorrectly
+            - **Fixed GIF export** frame delay rounding
+            - **Fixed velocity display units** for SRV product
+            - **Fixed wall mode crash** on missing fetcher
+            - **Fixed concurrent download race condition**
+            - **Fixed color table** producing wrong colors for extreme values
+            - **Fixed macOS Gatekeeper** "damaged app" error with ad-hoc code signing
+            - Various other stability improvements
+
+            ### macOS Users
+            If you still see a Gatekeeper warning, right-click the app and select "Open", or run:
+            ```
+            xattr -cr /Applications/NexView.app
+            ```
+
+            ### Downloads
+            | Platform | File |
+            |----------|------|
+            | Windows x64 | `NexView-Windows-x64.zip` |
+            | macOS Apple Silicon | `NexView-macOS-AppleSilicon.dmg` |
+            | macOS Intel | `NexView-macOS-Intel.dmg` |
+            | Linux x64 | `NexView-Linux-x64.tar.gz` |
           files: |
             artifacts/windows-build/NexView-Windows-x64.zip
             artifacts/macos-intel-build/NexView-macOS-Intel.dmg
