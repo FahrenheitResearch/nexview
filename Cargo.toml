@@ -49,7 +49,7 @@ pollster = "0.4"
 rustmaps = { git = "https://github.com/FahrenheitResearch/rustmaps.git", optional = true }
 
 [features]
-default = []
+default = ["local-maps"]
 local-maps = ["rustmaps"]
 
 # --- Native-only dependencies ---

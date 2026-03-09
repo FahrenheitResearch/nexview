@@ -2,7 +2,6 @@ use egui::{self, Ui};
 use crate::app::RadarApp;
 use crate::nexrad::{RadarProduct, sites::RADAR_SITES};
 use crate::render::color_table::ColorTablePreset;
-use crate::render::map::TileProvider;
 
 pub struct SidePanel;
 
@@ -260,21 +259,6 @@ impl SidePanel {
                 app.start_wall_mode();
             }
         }
-
-        // Map style
-        ui.horizontal(|ui| {
-            ui.label("Map:");
-            let current = app.tile_manager.provider();
-            egui::ComboBox::from_id_salt("map_style")
-                .selected_text(current.label())
-                .show_ui(ui, |ui| {
-                    for provider in TileProvider::all() {
-                        if ui.selectable_label(current == *provider, provider.label()).clicked() {
-                            app.set_tile_provider(*provider);
-                        }
-                    }
-                });
-        });
 
         // Color table preset
         ui.horizontal(|ui| {

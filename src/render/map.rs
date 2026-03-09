@@ -1,10 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
-#[cfg(feature = "local-maps")]
 static RUSTMAPS_RENDERER: OnceLock<rustmaps::render::TileRenderer> = OnceLock::new();
 
-#[cfg(feature = "local-maps")]
 fn get_rustmaps_renderer() -> &'static rustmaps::render::TileRenderer {
     RUSTMAPS_RENDERER.get_or_init(|| {
         let exe_dir = std::env::current_exe()
@@ -20,55 +18,24 @@ fn get_rustmaps_renderer() -> &'static rustmaps::render::TileRenderer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TileProvider {
-    OpenStreetMap,
-    Dark,
-    Topographic,
-    Satellite,
-    #[cfg(feature = "local-maps")]
     Weather,
 }
 
 impl TileProvider {
     pub fn label(&self) -> &str {
         match self {
-            Self::OpenStreetMap => "Standard",
-            Self::Dark => "Dark",
-            Self::Topographic => "Topographic",
-            Self::Satellite => "Satellite",
-            #[cfg(feature = "local-maps")]
             Self::Weather => "Weather (Dark)",
         }
     }
 
     pub fn all() -> &'static [TileProvider] {
-        &[
-            Self::OpenStreetMap,
-            Self::Dark,
-            Self::Topographic,
-            Self::Satellite,
-            #[cfg(feature = "local-maps")]
-            Self::Weather,
-        ]
-    }
-
-    fn url(&self, z: u8, x: u32, y: u32) -> String {
-        match self {
-            Self::OpenStreetMap => format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
-            Self::Dark => format!("https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"),
-            Self::Topographic => format!("https://tile.opentopomap.org/{z}/{x}/{y}.png"),
-            Self::Satellite => format!("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
-            #[cfg(feature = "local-maps")]
-            Self::Weather => String::new(), // Rendered locally, no URL needed
-        }
+        &[Self::Weather]
     }
 }
 
 impl Default for TileProvider {
     fn default() -> Self {
-        #[cfg(feature = "local-maps")]
-        { Self::Weather }
-        #[cfg(not(feature = "local-maps"))]
-        { Self::Dark }
+        Self::Weather
     }
 }
 
@@ -362,58 +329,16 @@ impl MapTileManager {
         let cache = Arc::clone(&self.cache);
         let insertion_order = Arc::clone(&self.insertion_order);
         let pending = Arc::clone(&self.pending);
-        let provider = *self.provider.lock().unwrap();
 
-        #[cfg(feature = "local-maps")]
-        if provider == TileProvider::Weather {
-            self.runtime.spawn_blocking(move || {
-                let renderer = get_rustmaps_renderer();
-                let pixels_buf = renderer.render_tile(key.z, key.x, key.y);
-                let tile = TileData {
-                    width: 256,
-                    height: 256,
-                    pixels: pixels_buf.data,
-                };
-                Self::insert_with_eviction(&cache, &insertion_order, key, tile);
-                pending.lock().unwrap().retain(|k| k != &key);
-            });
-            return;
-        }
-
-        self.runtime.spawn(async move {
-            let url = provider.url(key.z, key.x, key.y);
-
-            let client = reqwest::Client::builder()
-                .user_agent("NexView/1.1 Weather Radar Viewer")
-                .build();
-
-            let client = match client {
-                Ok(c) => c,
-                Err(_) => {
-                    pending.lock().unwrap().retain(|k| k != &key);
-                    return;
-                }
+        self.runtime.spawn_blocking(move || {
+            let renderer = get_rustmaps_renderer();
+            let pixels_buf = renderer.render_tile(key.z, key.x, key.y);
+            let tile = TileData {
+                width: 256,
+                height: 256,
+                pixels: pixels_buf.data,
             };
-
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if let Ok(img) = image::load_from_memory(&bytes) {
-                            let rgba = img.to_rgba8();
-                            let tile = TileData {
-                                width: rgba.width(),
-                                height: rgba.height(),
-                                pixels: rgba.into_raw(),
-                            };
-                            Self::insert_with_eviction(&cache, &insertion_order, key, tile);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to fetch tile {}/{}/{}: {}", key.z, key.x, key.y, e);
-                }
-            }
-
+            Self::insert_with_eviction(&cache, &insertion_order, key, tile);
             pending.lock().unwrap().retain(|k| k != &key);
         });
     }
