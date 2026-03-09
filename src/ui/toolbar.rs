@@ -67,7 +67,13 @@ impl Toolbar {
 
                     ui.separator();
 
-                    // 6. Settings gear (placeholder)
+                    // 6. Multi-radar indicators
+                    if !app.secondary_radars.is_empty() {
+                        Self::multi_radar_chips(app, ui, accent, text_primary);
+                        ui.separator();
+                    }
+
+                    // 7. Settings gear (placeholder)
                     if ui.button(RichText::new("\u{2699}").size(16.0)).on_hover_text("Settings").clicked() {
                         // Placeholder — will be wired later
                     }
@@ -157,7 +163,7 @@ impl Toolbar {
                     app.estimate_storm_motion();
                 }
                 app.selected_product = product;
-                app.needs_render = true;
+                app.mark_all_needs_render();
             }
 
             if response.hovered() && !is_active {
@@ -288,6 +294,49 @@ impl Toolbar {
                 }
                 app.needs_render = true;
             }
+        }
+    }
+
+    /// Draw small "chips" for each loaded secondary radar, with an X to remove.
+    fn multi_radar_chips(
+        app: &mut RadarApp,
+        ui: &mut egui::Ui,
+        _accent: Color32,
+        _text_primary: Color32,
+    ) {
+        let secondary_color = Color32::from_rgb(100, 200, 255);
+        let mut to_remove: Option<String> = None;
+
+        for inst in &app.secondary_radars {
+            let loading = inst.fetcher.is_fetching();
+            let label_text = if loading {
+                format!("{} ...", inst.station_id)
+            } else {
+                inst.station_id.clone()
+            };
+
+            let chip_color = if inst.file.is_some() {
+                secondary_color
+            } else {
+                Color32::GRAY
+            };
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label(RichText::new(&label_text).color(chip_color).size(11.0).strong());
+                let x_btn = ui.add(
+                    egui::Button::new(RichText::new("x").color(Color32::from_gray(180)).size(10.0))
+                        .min_size(egui::vec2(14.0, 14.0))
+                        .fill(Color32::TRANSPARENT),
+                );
+                if x_btn.on_hover_text("Remove radar").clicked() {
+                    to_remove = Some(inst.station_id.clone());
+                }
+            });
+        }
+
+        if let Some(station) = to_remove {
+            app.remove_secondary_radar(&station);
         }
     }
 }

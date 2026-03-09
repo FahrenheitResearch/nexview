@@ -129,6 +129,9 @@ pub struct RadarApp {
     pub wall_loading_index: usize,
     pub wall_fetcher: Option<NexradFetcher>,
 
+    // Multi-radar: secondary radars displayed simultaneously on the map
+    pub secondary_radars: Vec<RadarInstance>,
+
     // Interaction
     pub cursor_lat: f64,
     pub cursor_lon: f64,
@@ -230,6 +233,32 @@ pub enum WallPanelStatus {
     Downloading,
     Loaded,
     Error,
+}
+
+/// A secondary radar instance loaded alongside the primary radar.
+/// Each has its own fetcher and rendering state.
+pub struct RadarInstance {
+    pub station_id: String,
+    pub file: Option<Level2File>,
+    pub texture: Option<egui::TextureHandle>,
+    pub range_km: Option<f64>,
+    pub fetcher: NexradFetcher,
+    pub needs_render: bool,
+}
+
+impl RadarInstance {
+    pub fn new(station_id: &str, runtime: &tokio::runtime::Handle) -> Self {
+        let inst = Self {
+            station_id: station_id.to_string(),
+            file: None,
+            texture: None,
+            range_km: None,
+            fetcher: NexradFetcher::new(runtime.clone()),
+            needs_render: false,
+        };
+        inst.fetcher.list_recent_files(station_id);
+        inst
+    }
 }
 
 /// Default wall stations — major metro area radars across the US
@@ -349,6 +378,8 @@ impl RadarApp {
             cross_section_result: None,
             cross_section_max_alt_km: 20.0,
 
+            secondary_radars: Vec::new(),
+
             cursor_lat: 0.0,
             cursor_lon: 0.0,
 
@@ -444,6 +475,9 @@ impl RadarApp {
     }
 
     pub fn select_station(&mut self, station_id: &str) {
+        // If the station was a secondary radar, remove it (it's now the primary)
+        self.secondary_radars.retain(|r| r.station_id != station_id);
+
         self.selected_station = station_id.to_string();
         if let Some(site) = sites::find_site(station_id) {
             self.map_view.center_lat = site.lat;
@@ -472,6 +506,41 @@ impl RadarApp {
 
         // Fall back to S3 fetch
         self.fetch_latest();
+    }
+
+    /// Mark the primary and all secondary radars as needing re-render.
+    /// Call this when a shared setting changes (product, color table, etc.).
+    pub fn mark_all_needs_render(&mut self) {
+        self.needs_render = true;
+        for inst in &mut self.secondary_radars {
+            inst.needs_render = true;
+        }
+    }
+
+    /// Add a secondary radar to display simultaneously on the map.
+    /// Does nothing if the station is already loaded (primary or secondary).
+    pub fn add_secondary_radar(&mut self, station_id: &str) {
+        // Don't add if it's the primary station
+        if self.selected_station == station_id {
+            return;
+        }
+        // Don't add duplicates
+        if self.secondary_radars.iter().any(|r| r.station_id == station_id) {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle = self.runtime.handle().clone();
+            let instance = RadarInstance::new(station_id, &handle);
+            log::info!("Added secondary radar: {}", station_id);
+            self.secondary_radars.push(instance);
+        }
+    }
+
+    /// Remove a secondary radar by station ID.
+    pub fn remove_secondary_radar(&mut self, station_id: &str) {
+        self.secondary_radars.retain(|r| r.station_id != station_id);
+        log::info!("Removed secondary radar: {}", station_id);
     }
 
     pub fn save_as_default(&mut self) {
@@ -1162,6 +1231,31 @@ impl RadarApp {
         ctx.request_repaint();
     }
 
+    /// Poll secondary radar fetchers for downloaded data and parse it.
+    fn check_secondary_downloads(&mut self, ctx: &egui::Context) {
+        for inst in &mut self.secondary_radars {
+            if let Some(data) = inst.fetcher.take_downloaded_data() {
+                match Level2File::parse(&data) {
+                    Ok(file) => {
+                        log::info!(
+                            "Secondary radar parsed: station={}, sweeps={}",
+                            file.station_id,
+                            file.sweeps.len(),
+                        );
+                        inst.file = Some(file);
+                        inst.needs_render = true;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to parse secondary radar {}: {}", inst.station_id, e);
+                    }
+                }
+            }
+        }
+
+        // Render textures for secondary radars that need it
+        self.render_secondary_radars(ctx);
+    }
+
     fn check_preload_downloads(&mut self) {
         if self.preload_rx.is_none() {
             return;
@@ -1380,6 +1474,64 @@ impl RadarApp {
         log::info!("Render total ({}): {:.1}ms", render_method, render_start.elapsed().as_secs_f64() * 1000.0);
     }
 
+    /// Render textures for secondary radars that have new data.
+    fn render_secondary_radars(&mut self, ctx: &egui::Context) {
+        let product = self.selected_product.base_product();
+        let color_table = crate::render::ColorTable::for_product_preset(product, self.color_preset);
+        let use_gpu = self.gpu_rendering && self.gpu_renderer.is_some();
+
+        for inst in &mut self.secondary_radars {
+            if !inst.needs_render {
+                continue;
+            }
+            inst.needs_render = false;
+
+            let file = match &inst.file {
+                Some(f) => f,
+                None => continue,
+            };
+            let site = match sites::find_site(&inst.station_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Find the best sweep for the selected product in this file
+            let base = product;
+            let require_sr = self.selected_product.is_super_res();
+            let sweep_idx = file.sweeps.iter().position(|s| {
+                Self::sweep_matches(s, base, require_sr)
+            }).or_else(|| {
+                file.sweeps.iter().position(|s| {
+                    Self::sweep_matches(s, base, false)
+                })
+            }).unwrap_or(0);
+
+            if let Some(sweep) = file.sweeps.get(sweep_idx) {
+                let rendered = if use_gpu {
+                    self.gpu_renderer.as_ref().unwrap()
+                        .render_sweep_gpu(sweep, product, site, 1024, &color_table)
+                } else {
+                    RadarRenderer::render_sweep_with_table(sweep, product, site, 1024, &color_table)
+                };
+                if let Some(rendered) = rendered {
+                    inst.range_km = Some(rendered.range_km);
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [rendered.width as usize, rendered.height as usize],
+                        &rendered.pixels,
+                    );
+                    inst.texture = Some(ctx.load_texture(
+                        format!("radar_secondary_{}", inst.station_id),
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                } else {
+                    inst.texture = None;
+                    inst.range_km = None;
+                }
+            }
+        }
+    }
+
     fn draw_map(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
@@ -1433,65 +1585,107 @@ impl RadarApp {
 
     fn get_radar_rect_for_range(&self, rect: egui::Rect, range_km: f64) -> Option<egui::Rect> {
         let site = sites::find_site(&self.selected_station)?;
+        self.get_radar_rect_for_site(rect, range_km, site)
+    }
+
+    /// Compute the screen rect for a radar overlay centered on the given site.
+    /// The rect is centered on the station's Mercator-projected position so
+    /// that the radar image center (which represents the station) aligns
+    /// correctly with other Mercator-projected overlays (warnings, map tiles).
+    fn get_radar_rect_for_site(&self, rect: egui::Rect, range_km: f64, site: &crate::nexrad::RadarSite) -> Option<egui::Rect> {
         let max_range_m = range_km * 1000.0;
 
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
 
+        // Project the station center to screen coordinates
+        let (cx, cy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
+
+        // Compute pixel extents by projecting the range edges and measuring
+        // the distance from center. Use the maximum extent in each direction
+        // to keep the radar image square in screen space.
         let range_deg_lat = max_range_m / 111139.0;
         let range_deg_lon = max_range_m / (111139.0 * site.lat.to_radians().cos());
 
-        let (top_x, top_y) = self.map_view.lat_lon_to_pixel(
-            site.lat + range_deg_lat, site.lon - range_deg_lon,
+        let (_, north_y) = self.map_view.lat_lon_to_pixel(
+            site.lat + range_deg_lat, site.lon,
             screen_w, screen_h,
         );
-        let (bot_x, bot_y) = self.map_view.lat_lon_to_pixel(
-            site.lat - range_deg_lat, site.lon + range_deg_lon,
+        let (east_x, _) = self.map_view.lat_lon_to_pixel(
+            site.lat, site.lon + range_deg_lon,
             screen_w, screen_h,
         );
 
+        let half_h = (cy - north_y).abs();
+        let half_w = (east_x - cx).abs();
+
         Some(egui::Rect::from_min_max(
-            egui::pos2(rect.left() + top_x as f32, rect.top() + top_y as f32),
-            egui::pos2(rect.left() + bot_x as f32, rect.top() + bot_y as f32),
+            egui::pos2(rect.left() + (cx - half_w) as f32, rect.top() + (cy - half_h) as f32),
+            egui::pos2(rect.left() + (cx + half_w) as f32, rect.top() + (cy + half_h) as f32),
         ))
     }
 
     fn draw_radar_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let tex = match &self.single_texture {
-            Some(t) => t,
-            None => return,
-        };
-
-        let radar_rect = match self.last_render_range_km.and_then(|r| self.get_radar_rect_for_range(rect, r)) {
-            Some(r) => r,
-            None => return,
-        };
-
-        ui.painter().image(
-            tex.id(),
-            radar_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
-        );
-
-        // Draw radar site marker
-        let site = match sites::find_site(&self.selected_station) {
-            Some(s) => s,
-            None => return,
-        };
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let opacity = egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8);
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
-        let (cx, cy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
-        let marker_pos = egui::pos2(rect.left() + cx as f32, rect.top() + cy as f32);
-        ui.painter().circle_filled(marker_pos, 4.0, egui::Color32::WHITE);
-        ui.painter().circle_stroke(marker_pos, 4.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
-        ui.painter().text(
-            marker_pos + egui::vec2(8.0, -8.0),
-            egui::Align2::LEFT_BOTTOM,
-            &self.selected_station,
-            egui::FontId::proportional(12.0),
-            egui::Color32::WHITE,
-        );
+
+        // Draw secondary radars first (underneath the primary)
+        for inst in &self.secondary_radars {
+            let tex = match &inst.texture {
+                Some(t) => t,
+                None => continue,
+            };
+            let site = match sites::find_site(&inst.station_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let radar_rect = match inst.range_km.and_then(|r| self.get_radar_rect_for_site(rect, r, site)) {
+                Some(r) => r,
+                None => continue,
+            };
+            ui.painter().image(tex.id(), radar_rect, uv, opacity);
+
+            // Draw station marker for secondary radar
+            let (cx, cy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
+            let marker_pos = egui::pos2(rect.left() + cx as f32, rect.top() + cy as f32);
+            let secondary_color = egui::Color32::from_rgb(100, 200, 255);
+            ui.painter().circle_filled(marker_pos, 4.0, secondary_color);
+            ui.painter().circle_stroke(marker_pos, 4.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+            ui.painter().text(
+                marker_pos + egui::vec2(8.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                &inst.station_id,
+                egui::FontId::proportional(12.0),
+                secondary_color,
+            );
+        }
+
+        // Draw primary radar
+        if let Some(tex) = &self.single_texture {
+            let radar_rect = match self.last_render_range_km.and_then(|r| self.get_radar_rect_for_range(rect, r)) {
+                Some(r) => r,
+                None => return,
+            };
+
+            ui.painter().image(tex.id(), radar_rect, uv, opacity);
+
+            // Draw radar site marker for primary
+            if let Some(site) = sites::find_site(&self.selected_station) {
+                let (cx, cy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
+                let marker_pos = egui::pos2(rect.left() + cx as f32, rect.top() + cy as f32);
+                ui.painter().circle_filled(marker_pos, 4.0, egui::Color32::WHITE);
+                ui.painter().circle_stroke(marker_pos, 4.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+                ui.painter().text(
+                    marker_pos + egui::vec2(8.0, -8.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &self.selected_station,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
     }
 
     /// Draw a timestamp overlay in the top-right corner of the given rect.
@@ -1574,6 +1768,9 @@ impl RadarApp {
                     );
                 }
             }
+
+            // Overlays (range rings, site marker, warnings, etc.)
+            self.draw_overlays_in_rect(ui, quad_rect);
 
             // Label
             ui.painter().rect_filled(
@@ -1777,12 +1974,15 @@ impl RadarApp {
             }
 
             let is_selected = site.id == self.selected_station;
+            let is_secondary = self.secondary_radars.iter().any(|r| r.station_id == site.id);
             let is_hovered = cursor_screen
                 .map(|c| c.distance(pos) < 15.0)
                 .unwrap_or(false);
 
             let color = if is_selected {
                 egui::Color32::from_rgb(255, 255, 0)
+            } else if is_secondary {
+                egui::Color32::from_rgb(100, 200, 255)
             } else if is_hovered {
                 egui::Color32::from_rgb(100, 200, 255)
             } else {
@@ -1791,6 +1991,8 @@ impl RadarApp {
 
             let radius = if is_selected {
                 6.0
+            } else if is_secondary {
+                5.5
             } else if is_hovered {
                 5.5
             } else {
@@ -1808,8 +2010,8 @@ impl RadarApp {
 
             ui.painter().circle_filled(pos, radius, color);
 
-            if self.map_view.zoom >= 7.0 || is_selected || is_hovered {
-                let label_color = if is_hovered && !is_selected {
+            if self.map_view.zoom >= 7.0 || is_selected || is_secondary || is_hovered {
+                let label_color = if is_hovered && !is_selected && !is_secondary {
                     egui::Color32::from_rgb(100, 200, 255)
                 } else {
                     color
@@ -1818,7 +2020,7 @@ impl RadarApp {
                     pos + egui::vec2(8.0, -8.0),
                     egui::Align2::LEFT_BOTTOM,
                     site.id,
-                    egui::FontId::proportional(if is_hovered { 12.0 } else { 10.0 }),
+                    egui::FontId::proportional(if is_hovered || is_secondary { 12.0 } else { 10.0 }),
                     label_color,
                 );
             }
@@ -1866,7 +2068,7 @@ impl RadarApp {
                         self.estimate_storm_motion();
                     }
                     self.selected_product = new_product;
-                    self.needs_render = true;
+                    self.mark_all_needs_render();
                 }
             }
             if i.key_pressed(egui::Key::ArrowLeft) {
@@ -1879,13 +2081,16 @@ impl RadarApp {
                         self.estimate_storm_motion();
                     }
                     self.selected_product = new_product;
-                    self.needs_render = true;
+                    self.mark_all_needs_render();
                 }
             }
 
             // Q: toggle quad view
             if i.key_pressed(egui::Key::Q) {
                 self.quad_view = !self.quad_view;
+                if self.quad_view {
+                    self.dual_pane = false; // mutually exclusive
+                }
                 self.needs_render = true;
             }
 
@@ -2016,7 +2221,7 @@ impl RadarApp {
                     self.estimate_storm_motion();
                 }
                 self.selected_product = new_product;
-                self.needs_render = true;
+                self.mark_all_needs_render();
             }
         }
     }
@@ -2075,11 +2280,21 @@ impl RadarApp {
                     self.sounding_texture = None; // Clear old texture, show spinner
                     self.sounding_pending = true;
                 } else {
+                    let shift_held = response.ctx.input(|i| i.modifiers.shift);
                     for site in sites::RADAR_SITES.iter() {
                         let (sx, sy) = self.map_view.lat_lon_to_pixel(site.lat, site.lon, screen_w, screen_h);
                         let dist = ((click_x - sx).powi(2) + (click_y - sy).powi(2)).sqrt();
                         if dist < 15.0 {
-                            self.select_station(site.id);
+                            if shift_held {
+                                // Shift+Click: add/remove as secondary radar
+                                if self.secondary_radars.iter().any(|r| r.station_id == site.id) {
+                                    self.remove_secondary_radar(site.id);
+                                } else {
+                                    self.add_secondary_radar(site.id);
+                                }
+                            } else {
+                                self.select_station(site.id);
+                            }
                             break;
                         }
                     }
@@ -2409,6 +2624,7 @@ impl eframe::App for RadarApp {
         }
         self.check_preload_downloads();
         self.check_wall_downloads(ctx);
+        self.check_secondary_downloads(ctx);
         // Refresh weather alerts every 60 seconds
         if self.show_warnings && self.alert_fetcher.should_refresh() {
             self.alert_fetcher.fetch_alerts();
@@ -2734,6 +2950,7 @@ impl eframe::App for RadarApp {
                         ("S",              "Toggle sounding mode"),
                         ("M",              "Toggle measure mode"),
                         ("L",              "Load latest data"),
+                        ("Shift+Click",    "Add/remove secondary radar"),
                         ("+ / -",          "Zoom in / out"),
                         ("Scroll",         "Zoom at cursor"),
                         ("Drag",           "Pan map"),
@@ -2761,8 +2978,9 @@ impl eframe::App for RadarApp {
         }
 
         // Only request continuous repaint when actually needed
+        let any_secondary_fetching = self.secondary_radars.iter().any(|r| r.fetcher.is_fetching());
         if self.anim_playing || self.anim_loading || self.fetcher.is_fetching()
-            || self.sounding_fetcher.is_fetching()
+            || self.sounding_fetcher.is_fetching() || any_secondary_fetching
         {
             ctx.request_repaint();
         } else {

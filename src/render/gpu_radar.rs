@@ -80,12 +80,21 @@ struct ColorEntry {
     a: f32,
 }
 
-@group(0) @binding(0) var output_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(0) var output_tex: texture_storage_2d<rgba8uint, write>;
 @group(0) @binding(1) var<storage, read> params: Params;
 @group(0) @binding(2) var<storage, read> radials: array<RadialInfo>;
 @group(0) @binding(3) var<storage, read> gate_data: array<f32>;
 @group(0) @binding(4) var<storage, read> color_entries: array<ColorEntry>;
 @group(0) @binding(5) var<storage, read> sorted_indices: array<u32>;
+
+fn to_rgba8(c: vec4<f32>) -> vec4<u32> {
+    return vec4<u32>(
+        u32(clamp(c.r * 255.0, 0.0, 255.0)),
+        u32(clamp(c.g * 255.0, 0.0, 255.0)),
+        u32(clamp(c.b * 255.0, 0.0, 255.0)),
+        u32(clamp(c.a * 255.0, 0.0, 255.0)),
+    );
+}
 
 fn color_for_value(value: f32) -> vec4<f32> {
     let num_entries = params.num_color_entries;
@@ -152,7 +161,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let range_m = sqrt(dx * dx + dy * dy) / scale;
     if range_m <= 0.0 || range_m > max_range {
-        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
@@ -212,20 +221,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         az_diff = 360.0 - az_diff;
     }
     if az_diff > radial.half_spacing + 0.1 {
-        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
     // Gate lookup
     let gate_offset = range_m - radial.first_gate_range;
     if gate_offset < 0.0 {
-        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
     let gate_idx = u32(gate_offset / radial.gate_size);
     if gate_idx >= radial.gate_count {
-        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
@@ -233,17 +242,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // NaN check: in WGSL, NaN != NaN
     if value != value {
-        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
     let color = color_for_value(value);
     if color.a == 0.0 {
-        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(output_tex, vec2<i32>(i32(px), i32(py)), vec4<u32>(0u, 0u, 0u, 0u));
         return;
     }
 
-    textureStore(output_tex, vec2<i32>(i32(px), i32(py)), color);
+    textureStore(output_tex, vec2<i32>(i32(px), i32(py)), to_rgba8(color));
 }
 "#;
 
@@ -267,7 +276,7 @@ impl GpuRadarRenderer {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: wgpu::TextureFormat::Rgba8Uint,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -508,7 +517,7 @@ impl GpuRadarRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8Uint,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });

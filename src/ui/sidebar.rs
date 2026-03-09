@@ -432,7 +432,7 @@ impl CollapsibleSidebar {
                     app.estimate_storm_motion();
                 }
                 app.selected_product = *product;
-                app.needs_render = true;
+                app.mark_all_needs_render();
             }
         }
 
@@ -459,13 +459,21 @@ impl CollapsibleSidebar {
 
         // View mode
         ui.label("View:");
-        ui.checkbox(&mut app.quad_view, "Quad View (4 products)");
+        if ui
+            .checkbox(&mut app.quad_view, "Quad View (4 products)")
+            .changed()
+        {
+            if app.quad_view {
+                app.dual_pane = false; // mutually exclusive
+            }
+            app.needs_render = true;
+        }
         if ui
             .checkbox(&mut app.dual_pane, "Dual Pane (side-by-side)")
             .changed()
         {
             if app.dual_pane {
-                app.quad_view = false;
+                app.quad_view = false; // mutually exclusive
             }
             app.needs_render = true;
         }
@@ -539,7 +547,7 @@ impl CollapsibleSidebar {
                             .clicked()
                         {
                             app.color_preset = *preset;
-                            app.needs_render = true;
+                            app.mark_all_needs_render();
                         }
                     }
                 });
