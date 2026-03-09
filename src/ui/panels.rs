@@ -298,6 +298,10 @@ impl SidePanel {
             ui.label("Map:");
             ui.add(egui::Slider::new(&mut app.map_opacity, 0.0..=1.0).step_by(0.01));
         });
+        ui.horizontal(|ui| {
+            ui.label("Warnings:");
+            ui.add(egui::Slider::new(&mut app.warning_opacity, 0.0..=1.0).step_by(0.01));
+        });
         ui.checkbox(&mut app.dark_mode, "Dark Mode");
 
         ui.separator();

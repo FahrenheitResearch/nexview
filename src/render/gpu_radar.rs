@@ -257,10 +257,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 impl GpuRadarRenderer {
-    /// Create a new GPU radar renderer from eframe's wgpu render state.
-    pub fn new(render_state: &egui_wgpu::RenderState) -> Self {
-        let device = render_state.device.clone();
-        let queue = render_state.queue.clone();
+    /// Create a new GPU radar renderer with its own dedicated wgpu device.
+    /// Uses a separate device from eframe's renderer to avoid interference
+    /// with the display pipeline (which can cause the radar to not appear).
+    pub fn new(_render_state: &egui_wgpu::RenderState) -> Option<Self> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("radar_compute_device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            },
+            None,
+        )).ok()?;
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radar_compute_shader"),
@@ -354,12 +374,12 @@ impl GpuRadarRenderer {
             cache: None,
         });
 
-        Self {
+        Some(Self {
             device,
             queue,
             pipeline,
             bind_group_layout,
-        }
+        })
     }
 
     /// Render a sweep on the GPU, returning the same RenderedSweep as CPU path.
@@ -640,6 +660,13 @@ impl GpuRadarRenderer {
 
         drop(data);
         readback_buffer.unmap();
+
+        // Validate that the GPU produced visible output (non-transparent pixels)
+        let non_transparent = pixels.chunks_exact(4).any(|px| px[3] > 0);
+        if !non_transparent {
+            log::warn!("GPU radar: output is entirely transparent — falling back to CPU");
+            return None;
+        }
 
         Some(RenderedSweep {
             pixels,

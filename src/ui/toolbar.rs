@@ -73,9 +73,16 @@ impl Toolbar {
                         ui.separator();
                     }
 
-                    // 7. Settings gear (placeholder)
+                    // 7. Export GIF (when animation loaded)
+                    if !app.anim_frames.is_empty() {
+                        if ui.button(RichText::new("GIF").size(11.0).strong()).on_hover_text("Export loop as GIF").clicked() {
+                            app.export_loop_gif();
+                        }
+                    }
+
+                    // 8. Settings gear
                     if ui.button(RichText::new("\u{2699}").size(16.0)).on_hover_text("Settings").clicked() {
-                        // Placeholder — will be wired later
+                        app.show_settings = !app.show_settings;
                     }
                 });
             });

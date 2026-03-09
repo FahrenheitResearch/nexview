@@ -153,6 +153,7 @@ pub struct RadarApp {
     // Weather alerts
     pub alert_fetcher: AlertFetcher,
     pub show_warnings: bool,
+    pub warning_opacity: f32,
 
     // Rotation detection
     pub meso_detections: Vec<crate::nexrad::detection::MesocycloneDetection>,
@@ -193,6 +194,7 @@ pub struct RadarApp {
 
     // Help overlay
     pub show_help: bool,
+    pub show_settings: bool,
 
     // Opacity & appearance
     pub radar_opacity: f32,
@@ -296,8 +298,8 @@ impl RadarApp {
         let fetcher = NexradFetcher::new(handle.clone());
         let tile_manager = MapTileManager::new(handle.clone());
 
-        // Try to initialize GPU compute renderer
-        let gpu_renderer = cc.wgpu_render_state.as_ref().map(|rs| {
+        // Try to initialize GPU compute renderer (uses its own dedicated wgpu device)
+        let gpu_renderer = cc.wgpu_render_state.as_ref().and_then(|rs| {
             log::info!("Initializing GPU compute radar renderer");
             GpuRadarRenderer::new(rs)
         });
@@ -392,6 +394,7 @@ impl RadarApp {
 
             alert_fetcher: AlertFetcher::new(handle.clone()),
             show_warnings: true,
+            warning_opacity: 1.0,
 
             meso_detections: Vec::new(),
             tvs_detections: Vec::new(),
@@ -425,6 +428,7 @@ impl RadarApp {
             perf: PerfStats::default(),
 
             show_help: false,
+            show_settings: false,
 
             radar_opacity: 0.85,
             map_opacity: 1.0,
@@ -1316,12 +1320,15 @@ impl RadarApp {
                 if let Some(sweep) = sweep {
                     let t0 = Instant::now();
                     let color_table = crate::render::ColorTable::for_product_preset(product, self.color_preset);
-                    let rendered = if use_gpu {
+                    let mut rendered = if use_gpu {
                         self.gpu_renderer.as_ref().unwrap()
                             .render_sweep_gpu(sweep, product, site, 512, &color_table)
                     } else {
-                        RadarRenderer::render_sweep(sweep, product, site, 512)
+                        None
                     };
+                    if rendered.is_none() {
+                        rendered = RadarRenderer::render_sweep(sweep, product, site, 512);
+                    }
                     self.perf.render_quad_times[i] = Some(t0.elapsed());
 
                     if let Some(rendered) = rendered {
@@ -1384,12 +1391,16 @@ impl RadarApp {
 
         if let Some(sweep) = render_sweep {
             let color_table = crate::render::ColorTable::for_product_preset(render_product, self.color_preset);
-            let rendered = if use_gpu {
+            let mut rendered = if use_gpu {
                 self.gpu_renderer.as_ref().unwrap()
                     .render_sweep_gpu(sweep, render_product, site, 1024, &color_table)
             } else {
-                RadarRenderer::render_sweep_with_table(sweep, render_product, site, 1024, &color_table)
+                None
             };
+            // Fall back to CPU if GPU returned None (empty output or error)
+            if rendered.is_none() {
+                rendered = RadarRenderer::render_sweep_with_table(sweep, render_product, site, 1024, &color_table);
+            }
             if let Some(rendered) = rendered {
                 self.last_render_range_km = Some(rendered.range_km);
                 let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -1442,12 +1453,15 @@ impl RadarApp {
 
             if let Some(sweep) = dp_sweep {
                 let color_table = crate::render::ColorTable::for_product_preset(dp_product, self.color_preset);
-                let rendered = if use_gpu {
+                let mut rendered = if use_gpu {
                     self.gpu_renderer.as_ref().unwrap()
                         .render_sweep_gpu(sweep, dp_product, site, 1024, &color_table)
                 } else {
-                    RadarRenderer::render_sweep_with_table(sweep, dp_product, site, 1024, &color_table)
+                    None
                 };
+                if rendered.is_none() {
+                    rendered = RadarRenderer::render_sweep_with_table(sweep, dp_product, site, 1024, &color_table);
+                }
                 if let Some(rendered) = rendered {
                     self.dual_pane_range_km = Some(rendered.range_km);
                     let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -1507,12 +1521,15 @@ impl RadarApp {
             }).unwrap_or(0);
 
             if let Some(sweep) = file.sweeps.get(sweep_idx) {
-                let rendered = if use_gpu {
+                let mut rendered = if use_gpu {
                     self.gpu_renderer.as_ref().unwrap()
                         .render_sweep_gpu(sweep, product, site, 1024, &color_table)
                 } else {
-                    RadarRenderer::render_sweep_with_table(sweep, product, site, 1024, &color_table)
+                    None
                 };
+                if rendered.is_none() {
+                    rendered = RadarRenderer::render_sweep_with_table(sweep, product, site, 1024, &color_table);
+                }
                 if let Some(rendered) = rendered {
                     inst.range_km = Some(rendered.range_km);
                     let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -1918,8 +1935,8 @@ impl RadarApp {
         );
         if self.show_warnings {
             let alerts = self.alert_fetcher.get_alerts();
-            crate::render::warnings::WarningRenderer::draw_warnings(
-                &alerts, &clipped, &self.map_view, rect,
+            crate::render::warnings::WarningRenderer::draw_warnings_with_opacity(
+                &alerts, &clipped, &self.map_view, rect, self.warning_opacity,
             );
         }
     }
@@ -2977,6 +2994,73 @@ impl eframe::App for RadarApp {
             }
         }
 
+        // Settings window
+        if self.show_settings {
+            let mut open = self.show_settings;
+            egui::Window::new("Settings")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(320.0)
+                .show(ctx, |ui| {
+                    ui.heading("Display");
+                    ui.horizontal(|ui| {
+                        ui.label("Radar opacity:");
+                        ui.add(egui::Slider::new(&mut self.radar_opacity, 0.0..=1.0).step_by(0.01));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Map opacity:");
+                        ui.add(egui::Slider::new(&mut self.map_opacity, 0.0..=1.0).step_by(0.01));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Warning opacity:");
+                        ui.add(egui::Slider::new(&mut self.warning_opacity, 0.0..=1.0).step_by(0.01));
+                    });
+                    ui.checkbox(&mut self.dark_mode, "Dark Mode");
+
+                    ui.separator();
+                    ui.heading("Overlays");
+                    ui.checkbox(&mut self.show_warnings, "NWS Warnings");
+                    ui.checkbox(&mut self.show_range_rings, "Range Rings");
+
+                    ui.separator();
+                    ui.heading("Rendering");
+                    if self.gpu_renderer.is_some() {
+                        ui.checkbox(&mut self.gpu_rendering, "GPU Rendering");
+                    } else {
+                        ui.label("GPU rendering: not available");
+                    }
+
+                    ui.separator();
+                    ui.heading("Defaults");
+                    ui.horizontal(|ui| {
+                        ui.label("Default station:");
+                        ui.text_edit_singleline(&mut self.settings.default_station);
+                    });
+                    if ui.button("Save defaults").clicked() {
+                        self.settings.default_zoom = self.map_view.zoom;
+                        self.settings.quad_view = self.quad_view;
+                        self.settings.save();
+                    }
+
+                    ui.separator();
+                    ui.heading("Export");
+                    if !self.anim_frames.is_empty() {
+                        if ui.button(format!("Export GIF ({} frames)", self.anim_frames.len())).clicked() {
+                            self.export_loop_gif();
+                        }
+                        if let Some(status) = &self.gif_export_status {
+                            ui.label(status.as_str());
+                        }
+                    } else {
+                        ui.weak("Load an animation loop to export GIF");
+                    }
+                });
+            if !open {
+                self.show_settings = false;
+            }
+        }
+
         // Only request continuous repaint when actually needed
         let any_secondary_fetching = self.secondary_radars.iter().any(|r| r.fetcher.is_fetching());
         if self.anim_playing || self.anim_loading || self.fetcher.is_fetching()
@@ -3027,8 +3111,8 @@ impl RadarApp {
         // Weather warnings
         if self.show_warnings {
             let alerts = self.alert_fetcher.get_alerts();
-            crate::render::warnings::WarningRenderer::draw_warnings(
-                &alerts, ui.painter(), &self.map_view, rect,
+            crate::render::warnings::WarningRenderer::draw_warnings_with_opacity(
+                &alerts, ui.painter(), &self.map_view, rect, self.warning_opacity,
             );
         }
 

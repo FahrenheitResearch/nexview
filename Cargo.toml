@@ -43,6 +43,7 @@ gif = "0.13"
 
 # Misc
 anyhow = "1"
+pollster = "0.4"
 
 # Local tile rendering (optional)
 rustmaps = { git = "https://github.com/FahrenheitResearch/rustmaps.git", optional = true }

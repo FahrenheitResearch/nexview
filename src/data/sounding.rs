@@ -170,17 +170,23 @@ impl SoundingFetcher {
         self.runtime.spawn(async move {
             log::info!("Fetching sounding for ({lat:.2}, {lon:.2})");
 
-            // Fetch and parse sounding data. If anything panics, we still
-            // clear the `fetching` flag so the UI doesn't get stuck.
+            // Guard that clears `fetching` on drop — even if the task panics.
+            struct FetchGuard(Arc<Mutex<bool>>);
+            impl Drop for FetchGuard {
+                fn drop(&mut self) {
+                    *self.0.lock().unwrap() = false;
+                }
+            }
+            let _guard = FetchGuard(Arc::clone(&fetching));
+
             let profile = fetch_sounding_inner(&http, lat, lon).await;
 
             if profile.is_none() {
                 log::error!("All sounding sources failed for ({lat:.2}, {lon:.2})");
             }
 
-            // Always clear state — even if profile is None.
             *result.lock().unwrap() = profile;
-            *fetching.lock().unwrap() = false;
+            // _guard drops here and clears fetching = false
         });
     }
 }

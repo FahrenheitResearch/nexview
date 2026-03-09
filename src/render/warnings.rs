@@ -20,6 +20,17 @@ impl WarningRenderer {
         map_view: &MapView,
         rect: Rect,
     ) {
+        Self::draw_warnings_with_opacity(alerts, painter, map_view, rect, 1.0);
+    }
+
+    /// Draw warning polygons on the map with adjustable opacity (0.0 - 1.0)
+    pub fn draw_warnings_with_opacity(
+        alerts: &[WeatherAlert],
+        painter: &Painter,
+        map_view: &MapView,
+        rect: Rect,
+        opacity: f32,
+    ) {
         let screen_w = rect.width() as f64;
         let screen_h = rect.height() as f64;
         let offset = rect.min;
@@ -47,14 +58,20 @@ impl WarningRenderer {
                     style.stroke_color.r(),
                     style.stroke_color.g(),
                     style.stroke_color.b(),
-                    style.fill_alpha,
+                    (style.fill_alpha as f32 * opacity) as u8,
                 );
                 // Use triangle fan to fill the polygon
                 Self::fill_polygon(painter, &screen_points, fill_color, rect);
             }
 
             // Draw stroke outline using line segments
-            let stroke = Stroke::new(style.stroke_width, style.stroke_color);
+            let stroke_color = Color32::from_rgba_unmultiplied(
+                style.stroke_color.r(),
+                style.stroke_color.g(),
+                style.stroke_color.b(),
+                (style.stroke_color.a() as f32 * opacity) as u8,
+            );
+            let stroke = Stroke::new(style.stroke_width, stroke_color);
             for i in 0..screen_points.len() {
                 let j = (i + 1) % screen_points.len();
                 painter.line_segment([screen_points[i], screen_points[j]], stroke);
