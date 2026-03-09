@@ -1,0 +1,418 @@
+use anyhow::{anyhow, Result};
+use byteorder::{BigEndian, ReadBytesExt};
+use bzip2::read::BzDecoder;
+use rayon::prelude::*;
+use std::io::{Cursor, Read};
+
+use super::products::RadarProduct;
+
+/// NEXRAD Level 2 (Archive II) file parser
+/// Specification: ICD 2620010H (RDA/RPG)
+
+const VOLUME_HEADER_SIZE: usize = 24;
+const MSG_HEADER_SIZE: usize = 16;
+const MSG31_HEADER_SIZE: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct Level2File {
+    pub station_id: String,
+    pub volume_date: u16,
+    pub volume_time: u32,
+    pub sweeps: Vec<Level2Sweep>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Level2Sweep {
+    pub elevation_number: u8,
+    pub elevation_angle: f32,
+    pub radials: Vec<RadialData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RadialData {
+    pub azimuth: f32,
+    pub elevation: f32,
+    pub azimuth_spacing: f32,
+    pub moments: Vec<MomentData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MomentData {
+    pub product: RadarProduct,
+    pub gate_count: u16,
+    pub first_gate_range: u16, // meters
+    pub gate_size: u16,        // meters
+    pub data: Vec<f32>,        // decoded values
+}
+
+#[derive(Debug)]
+struct VolumeHeader {
+    station_id: String,
+    volume_date: u16,
+    volume_time: u32,
+}
+
+#[derive(Debug)]
+struct MessageHeader {
+    message_size: u16,
+    message_type: u8,
+    _id_sequence: u16,
+    _julian_date: u16,
+    _milliseconds: u32,
+    _segment_count: u16,
+    _segment_number: u16,
+}
+
+#[derive(Debug)]
+struct Message31Header {
+    radar_id: [u8; 4],
+    azimuth_angle: f32,
+    elevation_angle: f32,
+    azimuth_number: u16,
+    elevation_number: u8,
+    azimuth_resolution: u8,
+    _cut_sector_number: u8,
+    data_block_count: u16,
+}
+
+#[derive(Debug)]
+struct DataBlockPointer {
+    block_type: String,
+    offset: u32,
+}
+
+impl Level2File {
+    pub fn parse(raw_data: &[u8]) -> Result<Self> {
+        // Check if data starts with "AR2V" or "ARCHIVE2"
+        let header_str = String::from_utf8_lossy(&raw_data[..std::cmp::min(9, raw_data.len())]);
+
+        let data = if header_str.starts_with("AR2V") || header_str.starts_with("ARCH") {
+            // Has volume header, decompress remainder
+            Self::decompress_archive2(raw_data)?
+        } else {
+            // Already decompressed or different format
+            raw_data.to_vec()
+        };
+
+        let mut cursor = Cursor::new(&data);
+
+        // Parse volume header
+        let header = Self::read_volume_header(&mut cursor)?;
+
+        // Parse all messages
+        let mut sweeps_map: std::collections::BTreeMap<u8, Level2Sweep> = std::collections::BTreeMap::new();
+
+        while (cursor.position() as usize) < data.len() - MSG_HEADER_SIZE {
+            match Self::read_message(&mut cursor, &data) {
+                Ok(Some((elev_num, radial))) => {
+                    let sweep = sweeps_map.entry(elev_num).or_insert_with(|| Level2Sweep {
+                        elevation_number: elev_num,
+                        elevation_angle: radial.elevation,
+                        radials: Vec::new(),
+                    });
+                    sweep.radials.push(radial);
+                }
+                Ok(None) => continue,
+                Err(_) => break,
+            }
+        }
+
+        Ok(Level2File {
+            station_id: header.station_id,
+            volume_date: header.volume_date,
+            volume_time: header.volume_time,
+            sweeps: sweeps_map.into_values().collect(),
+        })
+    }
+
+    fn decompress_archive2(raw_data: &[u8]) -> Result<Vec<u8>> {
+        if raw_data.len() < VOLUME_HEADER_SIZE {
+            return Err(anyhow!("Data too short for volume header"));
+        }
+
+        // Phase 1: collect block boundaries (fast, single-threaded scan)
+        let mut blocks: Vec<(usize, usize, bool)> = Vec::new(); // (start, len, is_bz2)
+        let mut pos = VOLUME_HEADER_SIZE;
+
+        while pos < raw_data.len() {
+            if pos + 4 > raw_data.len() {
+                break;
+            }
+
+            let block_size = i32::from_be_bytes([
+                raw_data[pos], raw_data[pos + 1], raw_data[pos + 2], raw_data[pos + 3],
+            ]);
+            pos += 4;
+
+            let actual_size = block_size.unsigned_abs() as usize;
+            if pos + actual_size > raw_data.len() {
+                break;
+            }
+
+            let is_bz2 = actual_size >= 2 && raw_data[pos] == b'B' && raw_data[pos + 1] == b'Z';
+            blocks.push((pos, actual_size, is_bz2));
+            pos += actual_size;
+        }
+
+        // Phase 2: decompress all blocks in parallel
+        let decompressed: Vec<Vec<u8>> = blocks.par_iter()
+            .map(|&(start, len, is_bz2)| {
+                let block_data = &raw_data[start..start + len];
+                if is_bz2 {
+                    let mut decoder = BzDecoder::new(block_data);
+                    let mut out = Vec::new();
+                    match decoder.read_to_end(&mut out) {
+                        Ok(_) => out,
+                        Err(_) => block_data.to_vec(),
+                    }
+                } else {
+                    block_data.to_vec()
+                }
+            })
+            .collect();
+
+        // Phase 3: concatenate in order
+        let total_size: usize = VOLUME_HEADER_SIZE + decompressed.iter().map(|b| b.len()).sum::<usize>();
+        let mut result = Vec::with_capacity(total_size);
+        result.extend_from_slice(&raw_data[..VOLUME_HEADER_SIZE]);
+        for block in decompressed {
+            result.extend_from_slice(&block);
+        }
+
+        Ok(result)
+    }
+
+    fn read_volume_header(cursor: &mut Cursor<&Vec<u8>>) -> Result<VolumeHeader> {
+        // Archive II volume header is 24 bytes:
+        //  0-11: filename (e.g. "AR2V0006.418")
+        // 12-15: extension number (u32)
+        // 16-17: date (modified Julian)
+        // 18-21: time (ms since midnight, u32)
+        // But actual ICAO is at bytes 20-23 in many files.
+        // Safer: read the whole 24 bytes and extract ICAO from the raw data.
+        let mut header = [0u8; 24];
+        cursor.read_exact(&mut header)?;
+
+        let filename_str = String::from_utf8_lossy(&header[..12]);
+
+        // Try to get station from the last 4 bytes (ICAO)
+        let icao = String::from_utf8_lossy(&header[20..24]).trim().to_string();
+
+        // Fallback: try to get from the Message 31 headers later
+        let station_id = if icao.len() == 4 && icao.chars().all(|c| c.is_ascii_alphanumeric()) {
+            icao
+        } else {
+            // Try extracting from filename
+            filename_str.chars().skip(4).take(4).collect::<String>()
+        };
+
+        let volume_date = u16::from_be_bytes([header[12], header[13]]);
+        let volume_time = u32::from_be_bytes([header[14], header[15], header[16], header[17]]);
+
+        Ok(VolumeHeader {
+            station_id,
+            volume_date,
+            volume_time,
+        })
+    }
+
+    fn read_message(cursor: &mut Cursor<&Vec<u8>>, data: &[u8]) -> Result<Option<(u8, RadialData)>> {
+        let start_pos = cursor.position() as usize;
+
+        // CTM header (12 bytes) - skip
+        if start_pos + 12 > data.len() {
+            return Err(anyhow!("End of data"));
+        }
+
+        // Check for CTM header
+        let mut ctm = [0u8; 12];
+        cursor.read_exact(&mut ctm)?;
+
+        // Read message header
+        if (cursor.position() as usize) + MSG_HEADER_SIZE > data.len() {
+            return Err(anyhow!("End of data"));
+        }
+
+        let msg_header = Self::read_message_header(cursor)?;
+
+        // We only care about Message Type 31 (Digital Radar Data)
+        if msg_header.message_type != 31 {
+            // Skip to next message (messages are 2432 bytes aligned for legacy types)
+            let next_pos = start_pos + 2432;
+            if next_pos <= data.len() {
+                cursor.set_position(next_pos as u64);
+            } else {
+                return Err(anyhow!("End of data"));
+            }
+            return Ok(None);
+        }
+
+        // Parse Message 31
+        let msg31_start = cursor.position() as usize;
+        let msg31 = Self::read_msg31_header(cursor)?;
+
+        // Read data block pointers
+        let mut block_pointers = Vec::new();
+        for _ in 0..msg31.data_block_count {
+            let offset = cursor.read_u32::<BigEndian>()?;
+            block_pointers.push(offset);
+        }
+
+        // Parse each data block
+        let mut moments = Vec::new();
+
+        for ptr_offset in &block_pointers {
+            let block_pos = msg31_start + *ptr_offset as usize;
+            if block_pos + 4 > data.len() {
+                continue;
+            }
+
+            let block_type = String::from_utf8_lossy(&data[block_pos..block_pos + 1]).to_string();
+
+            // 'D' = data moment block
+            if block_type == "D" {
+                if let Ok(moment) = Self::parse_moment_block(data, block_pos) {
+                    moments.push(moment);
+                }
+            }
+        }
+
+        // Calculate next message position
+        let msg_size_bytes = (msg_header.message_size as usize) * 2 + 12; // +12 for CTM
+        let next_pos = start_pos + std::cmp::max(msg_size_bytes, 2432);
+        if next_pos <= data.len() {
+            cursor.set_position(next_pos as u64);
+        }
+
+        let radial = RadialData {
+            azimuth: msg31.azimuth_angle,
+            elevation: msg31.elevation_angle,
+            azimuth_spacing: if msg31.azimuth_resolution == 1 { 0.5 } else { 1.0 },
+            moments,
+        };
+
+        Ok(Some((msg31.elevation_number, radial)))
+    }
+
+    fn read_message_header(cursor: &mut Cursor<&Vec<u8>>) -> Result<MessageHeader> {
+        let message_size = cursor.read_u16::<BigEndian>()?;
+        let _rda_channel = cursor.read_u8()?;
+        let message_type = cursor.read_u8()?;
+        let id_sequence = cursor.read_u16::<BigEndian>()?;
+        let julian_date = cursor.read_u16::<BigEndian>()?;
+        let milliseconds = cursor.read_u32::<BigEndian>()?;
+        let segment_count = cursor.read_u16::<BigEndian>()?;
+        let segment_number = cursor.read_u16::<BigEndian>()?;
+
+        Ok(MessageHeader {
+            message_size,
+            message_type,
+            _id_sequence: id_sequence,
+            _julian_date: julian_date,
+            _milliseconds: milliseconds,
+            _segment_count: segment_count,
+            _segment_number: segment_number,
+        })
+    }
+
+    fn read_msg31_header(cursor: &mut Cursor<&Vec<u8>>) -> Result<Message31Header> {
+        let mut radar_id = [0u8; 4];
+        cursor.read_exact(&mut radar_id)?;
+
+        let _collection_time = cursor.read_u32::<BigEndian>()?;
+        let _collection_date = cursor.read_u16::<BigEndian>()?;
+        let azimuth_number = cursor.read_u16::<BigEndian>()?;
+        let azimuth_angle = cursor.read_f32::<BigEndian>()?;
+        let _compression_indicator = cursor.read_u8()?;
+        let _spare = cursor.read_u8()?;
+        let _radial_length = cursor.read_u16::<BigEndian>()?;
+        let azimuth_resolution = cursor.read_u8()?;
+        let _radial_status = cursor.read_u8()?;
+        let elevation_number = cursor.read_u8()?;
+        let cut_sector_number = cursor.read_u8()?;
+        let elevation_angle = cursor.read_f32::<BigEndian>()?;
+        let _radial_spot_blanking = cursor.read_u8()?;
+        let _azimuth_indexing_mode = cursor.read_u8()?;
+        let data_block_count = cursor.read_u16::<BigEndian>()?;
+
+        Ok(Message31Header {
+            radar_id,
+            azimuth_angle,
+            elevation_angle,
+            azimuth_number,
+            elevation_number,
+            azimuth_resolution,
+            _cut_sector_number: cut_sector_number,
+            data_block_count,
+        })
+    }
+
+    fn parse_moment_block(data: &[u8], offset: usize) -> Result<MomentData> {
+        if offset + 28 > data.len() {
+            return Err(anyhow!("Moment block too short"));
+        }
+
+        let mut cursor = Cursor::new(&data[offset..]);
+
+        // Data moment block header (ICD 2620010H Table XVII-E):
+        // Byte 0: Data block type ('D')
+        // Bytes 1-3: Moment name (e.g. "REF", "VEL", "SW ", "ZDR", "PHI", "RHO", "CFP")
+        let _block_type = cursor.read_u8()?;
+        let mut name_bytes = [0u8; 3];
+        cursor.read_exact(&mut name_bytes)?;
+        let name = String::from_utf8_lossy(&name_bytes).trim().to_string();
+
+        // Bytes 4-7: Reserved (u32)
+        let _reserved = cursor.read_u32::<BigEndian>()?;
+        // Bytes 8-9: Number of data moment gates (u16)
+        let gate_count = cursor.read_u16::<BigEndian>()?;
+        // Bytes 10-11: Range to center of first gate (m) (u16)
+        let first_gate_range = cursor.read_u16::<BigEndian>()?;
+        // Bytes 12-13: Data moment gate interval (m) (u16)
+        let gate_size = cursor.read_u16::<BigEndian>()?;
+        // Bytes 14-15: Tover / SNR threshold parameter (u16)
+        let _tover = cursor.read_u16::<BigEndian>()?;
+        // Byte 16: SNR threshold (u8)
+        let _snr_threshold = cursor.read_u8()?;
+        // Byte 17: Control flags (u8)
+        let _control_flags = cursor.read_u8()?;
+        // Bytes 18-19: Data word size in bits (u16) - 8 or 16
+        let data_word_size = cursor.read_u16::<BigEndian>()?;
+        // Bytes 20-23: Scale (f32)
+        let scale = cursor.read_f32::<BigEndian>()?;
+        // Bytes 24-27: Offset (f32)
+        let offset_val = cursor.read_f32::<BigEndian>()?;
+
+
+        let product = RadarProduct::from_name(&name);
+
+        // Read gate data
+        let mut decoded = Vec::with_capacity(gate_count as usize);
+
+        for _ in 0..gate_count {
+            let raw = if data_word_size >= 16 {
+                cursor.read_u16::<BigEndian>()? as u32
+            } else {
+                cursor.read_u8()? as u32
+            };
+
+            // Decode: value = (raw - offset) / scale
+            // 0 = below threshold, 1 = range folded
+            let value = if raw <= 1 {
+                f32::NAN // below threshold or range folded
+            } else {
+                (raw as f32 - offset_val) / scale
+            };
+
+            decoded.push(value);
+        }
+
+        Ok(MomentData {
+            product,
+            gate_count,
+            first_gate_range,
+            gate_size,
+            data: decoded,
+        })
+    }
+}

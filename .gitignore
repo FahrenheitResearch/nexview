@@ -1,0 +1,7 @@
+/target
+nexview_settings.json
+test_*.png
+*.log
+test_log*.txt
+launch.bat
+create_shortcut.ps1
