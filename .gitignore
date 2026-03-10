@@ -1,0 +1,13 @@
+/target
+.cargo/config.toml
+nexview_settings.json
+test_*.png
+*.log
+*.gif
+test_log*.txt
+launch.bat
+create_shortcut.ps1
+models/
+rustmaps_data/
+scripts/
+test_output/

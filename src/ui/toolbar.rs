@@ -1,0 +1,376 @@
+use egui::{self, Color32, RichText};
+use crate::app::RadarApp;
+use crate::nexrad::{RadarProduct, sites::RADAR_SITES};
+
+/// Products shown in the toolbar tab bar.
+const TOOLBAR_PRODUCTS: &[(RadarProduct, &str)] = &[
+    (RadarProduct::SuperResReflectivity, "SR-R"),
+    (RadarProduct::SuperResVelocity, "SR-V"),
+    (RadarProduct::Reflectivity, "REF"),
+    (RadarProduct::Velocity, "VEL"),
+    (RadarProduct::SpectrumWidth, "SW"),
+    (RadarProduct::DifferentialReflectivity, "ZDR"),
+    (RadarProduct::CorrelationCoefficient, "CC"),
+    (RadarProduct::SpecificDiffPhase, "KDP"),
+    (RadarProduct::StormRelativeVelocity, "SRV"),
+    (RadarProduct::VIL, "VIL"),
+    (RadarProduct::EchoTops, "ET"),
+];
+
+pub struct Toolbar;
+
+impl Toolbar {
+    pub fn show(app: &mut RadarApp, ctx: &egui::Context) {
+        let accent = Color32::from_rgb(0x00, 0xE5, 0xFF);
+        let bg_panel = Color32::from_rgb(0x25, 0x25, 0x35);
+        let text_primary = Color32::from_rgb(0xE0, 0xE0, 0xE0);
+        let text_secondary = Color32::from_rgb(0x80, 0x80, 0x90);
+        let border = Color32::from_rgb(0x35, 0x35, 0x45);
+
+        egui::TopBottomPanel::top("toolbar_top")
+            .exact_height(36.0)
+            .frame(egui::Frame::new()
+                .fill(bg_panel)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .stroke(egui::Stroke::new(1.0, border)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+
+                    // 1. App label
+                    ui.label(
+                        RichText::new("NexView")
+                            .color(accent)
+                            .strong()
+                            .size(15.0),
+                    );
+
+                    ui.separator();
+
+                    // 2. Station dropdown (compact combo box with search)
+                    Self::station_combo(app, ui, accent, text_primary, text_secondary);
+
+                    ui.separator();
+
+                    // 3. Product tab bar
+                    Self::product_tabs(app, ui, accent, bg_panel, text_primary, text_secondary);
+
+                    ui.separator();
+
+                    // 4. Elevation selector (compact up/down + angle)
+                    Self::elevation_compact(app, ui, text_primary, text_secondary);
+
+                    ui.separator();
+
+                    // 5. View mode buttons
+                    Self::view_mode_buttons(app, ui, accent, text_primary);
+
+                    ui.separator();
+
+                    // 6. Multi-radar indicators
+                    if !app.secondary_radars.is_empty() {
+                        Self::multi_radar_chips(app, ui, accent, text_primary);
+                        ui.separator();
+                    }
+
+                    // 7. Export GIF (when animation loaded)
+                    if !app.anim_frames.is_empty() {
+                        let gif_label = if app.multi_radar_anim { "Group GIF" } else { "GIF" };
+                        let gif_tip = if app.multi_radar_anim { "Export composite group radar GIF" } else { "Export loop as GIF" };
+                        if ui.button(RichText::new(gif_label).size(11.0).strong()).on_hover_text(gif_tip).clicked() {
+                            app.export_loop_gif();
+                        }
+                    }
+
+                    // 8. Settings gear
+                    if ui.button(RichText::new("\u{2699}").size(16.0)).on_hover_text("Settings").clicked() {
+                        app.show_settings = !app.show_settings;
+                    }
+                });
+            });
+    }
+
+    fn station_combo(
+        app: &mut RadarApp,
+        ui: &mut egui::Ui,
+        accent: Color32,
+        text_primary: Color32,
+        _text_secondary: Color32,
+    ) {
+        let station_text = RichText::new(&app.selected_station)
+            .color(accent)
+            .strong()
+            .size(13.0);
+
+        egui::ComboBox::from_id_salt("toolbar_station")
+            .selected_text(station_text)
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.text_edit_singleline(&mut app.station_filter);
+                });
+
+                let filter = app.station_filter.to_uppercase();
+
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .id_salt("toolbar_station_list")
+                    .show(ui, |ui| {
+                        for site in RADAR_SITES.iter() {
+                            if !filter.is_empty()
+                                && !site.id.contains(&filter)
+                                && !site.name.to_uppercase().contains(&filter)
+                                && !site.state.contains(&filter)
+                            {
+                                continue;
+                            }
+
+                            let label = format!("{} - {}", site.id, site.name);
+                            let selected = app.selected_station == site.id;
+                            if ui.selectable_label(selected, &label).clicked() {
+                                app.select_station(site.id);
+                            }
+                        }
+                    });
+            });
+    }
+
+    fn product_tabs(
+        app: &mut RadarApp,
+        ui: &mut egui::Ui,
+        accent: Color32,
+        bg_panel: Color32,
+        text_primary: Color32,
+        text_secondary: Color32,
+    ) {
+        for &(product, label) in TOOLBAR_PRODUCTS {
+            let is_active = app.selected_product == product;
+
+            let text = if is_active {
+                RichText::new(label).color(bg_panel).strong().size(11.0)
+            } else {
+                RichText::new(label).color(text_secondary).size(11.0)
+            };
+
+            let button = egui::Button::new(text)
+                .corner_radius(egui::CornerRadius::same(3))
+                .min_size(egui::vec2(28.0, 22.0));
+
+            let button = if is_active {
+                button.fill(accent)
+            } else {
+                button.fill(Color32::TRANSPARENT)
+            };
+
+            let response = ui.add(button);
+
+            if response.clicked() {
+                if product == crate::nexrad::RadarProduct::StormRelativeVelocity
+                    && app.selected_product != crate::nexrad::RadarProduct::StormRelativeVelocity
+                {
+                    app.estimate_storm_motion();
+                }
+                app.selected_product = product;
+                // Snap elevation to a valid tilt for the new product
+                if let Some(idx) = app.find_sweep_for_product(product) {
+                    app.selected_elevation = idx;
+                }
+                app.mark_all_needs_render();
+            }
+
+            if response.hovered() && !is_active {
+                // Tooltip with full name
+                response.on_hover_text(product.display_name());
+            }
+        }
+    }
+
+    #[allow(unused_variables)]
+    fn elevation_compact(
+        app: &mut RadarApp,
+        ui: &mut egui::Ui,
+        text_primary: Color32,
+        text_secondary: Color32,
+    ) {
+        let valid_indices = app.valid_sweep_indices(app.selected_product);
+
+        let angle_text = if let Some(ref file) = app.current_file {
+            if let Some(sweep) = file.sweeps.get(app.selected_elevation) {
+                format!("{:.1}\u{00B0}", sweep.elevation_angle)
+            } else {
+                "--.-\u{00B0}".to_string()
+            }
+        } else {
+            "--.-\u{00B0}".to_string()
+        };
+
+        // Find current position in the valid indices list
+        let current_pos = valid_indices.iter().position(|&i| i == app.selected_elevation);
+        let can_go_down = current_pos.map_or(false, |pos| pos > 0);
+        let can_go_up = current_pos.map_or(false, |pos| pos + 1 < valid_indices.len());
+
+        // Down arrow (lower elevation = earlier in valid_indices)
+        if ui.add_enabled(
+            can_go_down,
+            egui::Button::new(RichText::new("\u{25BC}").size(10.0))
+                .min_size(egui::vec2(18.0, 22.0)),
+        ).clicked() {
+            if let Some(pos) = current_pos {
+                app.selected_elevation = valid_indices[pos - 1];
+                app.needs_render = true;
+            }
+        }
+
+        ui.label(
+            RichText::new(&angle_text)
+                .color(text_primary)
+                .size(12.0)
+                .monospace(),
+        );
+
+        // Up arrow (higher elevation = later in valid_indices)
+        if ui.add_enabled(
+            can_go_up,
+            egui::Button::new(RichText::new("\u{25B2}").size(10.0))
+                .min_size(egui::vec2(18.0, 22.0)),
+        ).clicked() {
+            if let Some(pos) = current_pos {
+                app.selected_elevation = valid_indices[pos + 1];
+                app.needs_render = true;
+            }
+        }
+    }
+
+    fn view_mode_buttons(
+        app: &mut RadarApp,
+        ui: &mut egui::Ui,
+        accent: Color32,
+        text_primary: Color32,
+    ) {
+        #[derive(PartialEq)]
+        enum ViewMode { Single, Quad, Dual, Wall, Mosaic }
+
+        let current = if app.mosaic_mode {
+            ViewMode::Mosaic
+        } else if app.wall_mode {
+            ViewMode::Wall
+        } else if app.quad_view {
+            ViewMode::Quad
+        } else if app.dual_pane {
+            ViewMode::Dual
+        } else {
+            ViewMode::Single
+        };
+
+        let modes = [
+            (ViewMode::Single, "1"),
+            (ViewMode::Quad, "4"),
+            (ViewMode::Dual, "2"),
+            (ViewMode::Wall, "W"),
+            (ViewMode::Mosaic, "M"),
+        ];
+
+        for (mode, label) in &modes {
+            let is_active = current == *mode;
+            let text = if is_active {
+                RichText::new(*label).color(Color32::BLACK).strong().size(11.0)
+            } else {
+                RichText::new(*label).color(text_primary).size(11.0)
+            };
+
+            let button = egui::Button::new(text)
+                .corner_radius(egui::CornerRadius::same(3))
+                .min_size(egui::vec2(22.0, 22.0));
+
+            let button = if is_active {
+                button.fill(accent)
+            } else {
+                button.fill(Color32::TRANSPARENT)
+            };
+
+            if ui.add(button).clicked() {
+                match mode {
+                    ViewMode::Single => {
+                        app.quad_view = false;
+                        app.dual_pane = false;
+                        app.wall_mode = false;
+                        if app.mosaic_mode { app.deactivate_mosaic_mode(); }
+                    }
+                    ViewMode::Quad => {
+                        app.quad_view = true;
+                        app.dual_pane = false;
+                        app.wall_mode = false;
+                        if app.mosaic_mode { app.deactivate_mosaic_mode(); }
+                    }
+                    ViewMode::Dual => {
+                        app.quad_view = false;
+                        app.dual_pane = true;
+                        app.wall_mode = false;
+                        if app.mosaic_mode { app.deactivate_mosaic_mode(); }
+                    }
+                    ViewMode::Wall => {
+                        if !app.wall_mode {
+                            app.start_wall_mode();
+                        }
+                        app.quad_view = false;
+                        app.dual_pane = false;
+                        if app.mosaic_mode { app.deactivate_mosaic_mode(); }
+                    }
+                    ViewMode::Mosaic => {
+                        if !app.mosaic_mode {
+                            app.activate_mosaic_mode();
+                        }
+                        app.quad_view = false;
+                        app.dual_pane = false;
+                        app.wall_mode = false;
+                    }
+                }
+                app.needs_render = true;
+            }
+        }
+    }
+
+    /// Draw small "chips" for each loaded secondary radar, with an X to remove.
+    fn multi_radar_chips(
+        app: &mut RadarApp,
+        ui: &mut egui::Ui,
+        _accent: Color32,
+        _text_primary: Color32,
+    ) {
+        let secondary_color = Color32::from_rgb(100, 200, 255);
+        let mut to_remove: Option<String> = None;
+
+        for inst in &app.secondary_radars {
+            let loading = inst.fetcher.is_fetching();
+            let label_text = if loading {
+                format!("{} ...", inst.station_id)
+            } else {
+                inst.station_id.clone()
+            };
+
+            let chip_color = if inst.file.is_some() {
+                secondary_color
+            } else {
+                Color32::GRAY
+            };
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label(RichText::new(&label_text).color(chip_color).size(11.0).strong());
+                let x_btn = ui.add(
+                    egui::Button::new(RichText::new("x").color(Color32::from_gray(180)).size(10.0))
+                        .min_size(egui::vec2(14.0, 14.0))
+                        .fill(Color32::TRANSPARENT),
+                );
+                if x_btn.on_hover_text("Remove radar").clicked() {
+                    to_remove = Some(inst.station_id.clone());
+                }
+            });
+        }
+
+        if let Some(station) = to_remove {
+            app.remove_secondary_radar(&station);
+        }
+    }
+}

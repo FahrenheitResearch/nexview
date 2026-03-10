@@ -1,0 +1,82 @@
+[package]
+name = "nexview"
+version = "2.0.0"
+edition = "2021"
+description = "Open-source NEXRAD weather radar viewer written in Rust"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# GUI
+eframe = { version = "0.31", features = ["wgpu"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Networking
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+
+# Data parsing
+byteorder = "1.5"
+bzip2 = "0.5"
+flate2 = "1.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Math/Geo
+nalgebra = "0.33"
+
+# GPU
+wgpu = "24"
+egui-wgpu = "0.31"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Logging
+log = "0.4"
+
+# Export
+gif = "0.13"
+
+# Misc
+anyhow = "1"
+pollster = "0.4"
+
+# ML inference
+ort = { version = "2.0.0-rc.12", optional = true }
+ndarray = { version = "0.16", optional = true }
+
+# Local tile rendering (optional)
+rustmaps = { git = "https://github.com/FahrenheitResearch/rustmaps.git", optional = true }
+
+# HRRR weather model data
+hrrr-render = { git = "https://github.com/FahrenheitResearch/hrrr-render.git", default-features = false }
+
+[features]
+default = ["local-maps", "tornado-predict"]
+local-maps = ["rustmaps"]
+tornado-predict = ["ort", "ndarray"]
+
+# --- Native-only dependencies ---
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+rayon = "1.10"
+env_logger = "0.11"
+poll-promise = { version = "0.3", features = ["tokio"] }
+rfd = "0.15"
+
+# --- WASM-only dependencies ---
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+poll-promise = { version = "0.3", features = ["web"] }
+
+[profile.release]
+opt-level = 3
+lto = true
