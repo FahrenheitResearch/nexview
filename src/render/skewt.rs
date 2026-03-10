@@ -303,11 +303,21 @@ fn sat_mixing_ratio(temp_c: f64, pres_mb: f64) -> f64 {
 }
 
 fn moist_lapse_rate(temp_c: f64, pres_mb: f64) -> f64 {
+    if !temp_c.is_finite() || !pres_mb.is_finite() || pres_mb <= 0.0 {
+        return GAMMA_D;
+    }
     let t_k = temp_c + KELVIN;
+    if t_k <= 0.0 {
+        return GAMMA_D;
+    }
     let ws = sat_mixing_ratio(temp_c, pres_mb);
     let numer = 1.0 + LV * ws / (RD * t_k);
     let denom = 1.0 + LV * LV * ws / (CP * RV * t_k * t_k);
-    GAMMA_D * numer / denom
+    if denom.abs() < 1e-10 {
+        return GAMMA_D;
+    }
+    let result = GAMMA_D * numer / denom;
+    if result.is_finite() { result } else { GAMMA_D }
 }
 
 /// Potential temperature (K) from T (C) and P (hPa).
@@ -338,8 +348,14 @@ fn theta_w(temp_c: f64, pres_mb: f64) -> f64 {
     let mut p = pres_mb;
     let dp = -5.0;
     while p > 200.0 {
+        if !t.is_finite() {
+            break;
+        }
         let t_k = t + KELVIN;
-        let new_p = (p + dp).max(200.0);
+        let new_p = p + dp;
+        if new_p < 200.0 {
+            break;
+        }
         let dz = -(RD * t_k / G) * (dp / p);
         let gamma_m = moist_lapse_rate(t, p);
         t -= gamma_m * dz;
@@ -668,6 +684,10 @@ impl Canvas {
 
     /// Wu's antialiased line drawing.
     fn draw_line_aa(&mut self, x0: f64, y0: f64, x1: f64, y1: f64, col: [u8; 4]) {
+        // Guard: skip if any coordinate is non-finite (NaN/Inf causes billion-iteration loops)
+        if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+            return;
+        }
         let steep = (y1 - y0).abs() > (x1 - x0).abs();
         let (mut x0, mut y0, mut x1, mut y1) = if steep {
             (y0, x0, y1, x1)
@@ -692,6 +712,11 @@ impl Canvas {
         let xend2 = x1.round();
         let xpxl2 = xend2 as i32;
 
+        // Guard: prevent runaway loops from extreme coordinate differences
+        if (xpxl2 - xpxl1).abs() > 10000 {
+            return;
+        }
+
         for x in xpxl1..=xpxl2 {
             let fpart = intery - intery.floor();
             let y = intery as i32;
@@ -712,14 +737,24 @@ impl Canvas {
     fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, col: [u8; 4]) {
         let dx = (x1 - x0).abs();
         let dy = -(y1 - y0).abs();
+        // Guard: skip lines with extreme length (NaN-derived coords cast to i32::MIN)
+        if dx > 10000 || dy.abs() > 10000 {
+            return;
+        }
         let sx: i32 = if x0 < x1 { 1 } else { -1 };
         let sy: i32 = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
         let mut cx = x0;
         let mut cy = y0;
+        let max_steps = dx.max(dy.abs()) + 1;
+        let mut steps = 0;
         loop {
             self.put_pixel_blend(cx, cy, col);
             if cx == x1 && cy == y1 {
+                break;
+            }
+            steps += 1;
+            if steps > max_steps {
                 break;
             }
             let e2 = 2 * err;
@@ -753,10 +788,13 @@ impl Canvas {
 
     /// Dashed line.
     fn draw_dashed_line(&mut self, x0: f64, y0: f64, x1: f64, y1: f64, col: [u8; 4], dash: f64, gap: f64) {
+        if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+            return;
+        }
         let dx = x1 - x0;
         let dy = y1 - y0;
         let len = (dx * dx + dy * dy).sqrt();
-        if len < 1.0 {
+        if len < 1.0 || len > 10000.0 {
             return;
         }
         let ux = dx / len;
@@ -917,14 +955,23 @@ impl<'a> ClippedCanvas<'a> {
         // Simple: use Bresenham with clip check per pixel
         let dx = (x1 - x0).abs();
         let dy = -(y1 - y0).abs();
+        if dx > 10000 || dy.abs() > 10000 {
+            return;
+        }
         let sx: i32 = if x0 < x1 { 1 } else { -1 };
         let sy: i32 = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
         let mut cx = x0;
         let mut cy = y0;
+        let max_steps = dx.max(dy.abs()) + 1;
+        let mut steps = 0;
         loop {
             self.put_pixel_blend(cx, cy, col);
             if cx == x1 && cy == y1 {
+                break;
+            }
+            steps += 1;
+            if steps > max_steps {
                 break;
             }
             let e2 = 2 * err;
@@ -940,6 +987,9 @@ impl<'a> ClippedCanvas<'a> {
     }
 
     fn draw_line_aa(&mut self, x0: f64, y0: f64, x1: f64, y1: f64, col: [u8; 4]) {
+        if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+            return;
+        }
         let steep = (y1 - y0).abs() > (x1 - x0).abs();
         let (mut x0, mut y0, mut x1, mut y1) = if steep {
             (y0, x0, y1, x1)
@@ -957,6 +1007,9 @@ impl<'a> ClippedCanvas<'a> {
         let yend = y0 + gradient * (x0.round() - x0);
         let mut intery = yend + gradient;
         let xpxl2 = x1.round() as i32;
+        if (xpxl2 - xpxl1).abs() > 10000 {
+            return;
+        }
         for x in xpxl1..=xpxl2 {
             let fpart = intery - intery.floor();
             let y = intery as i32;
@@ -1125,14 +1178,20 @@ impl SkewTRenderer {
             let mut p = 1050.0;
             let dp = -5.0;
             let mut prev: Option<(i32, i32)> = None;
-            while p >= P_TOP {
+            while p > P_TOP {
+                if !t.is_finite() {
+                    break;
+                }
                 let (sx, sy) = tp_to_screen(t, p, plot_w, plot_h);
                 if let Some((px, py)) = prev {
                     c.draw_line(px, py, sx as i32, sy as i32, COL_MOIST_AD);
                 }
                 prev = Some((sx as i32, sy as i32));
                 let t_k = t + KELVIN;
-                let new_p = (p + dp).max(P_TOP);
+                let new_p = p + dp;
+                if new_p < P_TOP {
+                    break;
+                }
                 let dz = -(RD * t_k / G) * (dp / p);
                 let gamma_m = moist_lapse_rate(t, p);
                 t -= gamma_m * dz;
@@ -1182,7 +1241,13 @@ impl SkewTRenderer {
         path.push((t, p));
 
         while p > P_TOP {
-            let new_p = (p + dp).max(P_TOP);
+            if !t.is_finite() || !td.is_finite() || !p.is_finite() {
+                break;
+            }
+            let new_p = p + dp;
+            if new_p < P_TOP {
+                break;
+            }
             if !found_lcl {
                 let t_k = t + KELVIN;
                 let new_t_k = t_k * (new_p / p).powf(RD / CP);

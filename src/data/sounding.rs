@@ -199,17 +199,13 @@ async fn fetch_sounding_inner(
     lat: f64,
     lon: f64,
 ) -> Option<SoundingProfile> {
-    // ── Source 1: HRRR model sounding (any lat/lon in CONUS) ──────
-    log::info!("Trying HRRR model sounding at ({lat:.2}, {lon:.2})");
+    // ── Source 1: HRRR model sounding (any point in CONUS) ──
     match fetch_hrrr_sounding(lat, lon).await {
-        Ok(profile) => {
-            log::info!("HRRR sounding: {} levels at ({:.2}, {:.2})",
-                profile.levels.len(), lat, lon);
-            return Some(profile);
+        Ok(p) => {
+            log::info!("HRRR sounding: {} levels", p.levels.len());
+            return Some(p);
         }
-        Err(e) => {
-            log::warn!("HRRR sounding failed: {e}");
-        }
+        Err(e) => log::warn!("HRRR sounding failed: {e}"),
     }
 
     let station = nearest_station(lat, lon);

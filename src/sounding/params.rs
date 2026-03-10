@@ -249,7 +249,7 @@ pub fn cape_cin(profile: &SoundingProfile, parcel_type: ParcelType) -> ParcelRes
 
     ParcelResult {
         cape: cape.max(0.0),
-        cin: cin.min(0.0),
+        cin: cin.min(0.0).max(-2000.0), // clamp CIN to reasonable range
         lfc: lfc_p,
         el: el_p,
         li,
@@ -433,7 +433,7 @@ fn cape_cin_quick(profile: &SoundingProfile, t: f64, td: f64, p: f64) -> ParcelR
 
     ParcelResult {
         cape: cape.max(0.0),
-        cin: cin.min(0.0),
+        cin: cin.min(0.0).max(-2000.0),
         ..ParcelResult::default()
     }
 }
