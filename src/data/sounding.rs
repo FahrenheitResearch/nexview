@@ -293,12 +293,19 @@ use chrono::Timelike;
 /// Fetch a model sounding from HRRR pressure level data.
 /// Runs the blocking hrrr-render fetch on a dedicated thread via spawn_blocking.
 async fn fetch_hrrr_sounding(lat: f64, lon: f64) -> Result<SoundingProfile, String> {
-    let result = tokio::task::spawn_blocking(move || {
-        let status_fn = |msg: &str| {
-            log::info!("HRRR sounding: {}", msg);
-        };
-        hrrr_render::sounding::fetch_model_sounding("latest", 0, lat, lon, &status_fn)
-    }).await.map_err(|e| format!("spawn_blocking error: {e}"))?;
+    // Wrap spawn_blocking in a timeout to prevent indefinite hangs
+    // HRRR sounding downloads ~150 fields; cap total time at 30 seconds
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            let status_fn = |msg: &str| {
+                log::info!("HRRR sounding: {}", msg);
+            };
+            hrrr_render::sounding::fetch_model_sounding("latest", 0, lat, lon, &status_fn)
+        })
+    ).await
+        .map_err(|_| "HRRR sounding timed out after 30s".to_string())?
+        .map_err(|e| format!("spawn_blocking error: {e}"))?;
 
     let sounding = result.map_err(|e| format!("HRRR fetch error: {e}"))?;
 

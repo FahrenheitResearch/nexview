@@ -271,14 +271,15 @@ jobs:
           body: |
             ## NexView ${{ github.ref_name }}
 
-            ### Bug Fixes
-            - **Sounding crash fix** — Skew-T renderer no longer crashes the app on bad data
-            - **Super-res tilt filtering** — Only valid tilts shown for super-res products
-            - **GPU rendering defaults to off** — CPU+Rayon is faster
+            ### New Features
+            - **HRRR model soundings** — Click anywhere in CONUS for a full sounding with SHARPpy-equivalent parameter computation (CAPE/CIN, STP, SCP, SHIP, Bunkers, SRH, etc.)
+            - **HRRR map overlay** — View HRRR weather model data (reflectivity, 2m temp, wind, precip, and more) directly in the radar viewer
+            - **Bundled basemap** — No internet needed for map tiles, just extract and run
 
-            ### Changes
-            - Bundled basemap — no internet needed for map tiles, just extract and run
-            - All downloads include map data
+            ### Bug Fixes
+            - **Sounding freeze fix** — NaN guards and iteration limits prevent infinite loops in CAPE/CIN computation
+            - **Sounding timeout** — HRRR sounding fetch capped at 30 seconds with proper fallback to IEM/rucsoundings
+            - **Basemap visibility** — Map borders and coastlines now render on top of all weather data layers
 
             ### macOS Users
             If you see a Gatekeeper warning, right-click the app and select "Open", or run:

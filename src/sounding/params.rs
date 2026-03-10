@@ -179,9 +179,17 @@ pub fn cape_cin(profile: &SoundingProfile, parcel_type: ParcelType) -> ParcelRes
 
     let mut h = sfc_h;
     let mut p_t = parcel_t; // parcel temperature during ascent
+    let max_iterations = ((max_h - sfc_h) / dz) as usize + 100; // safety cap
+    let mut iter = 0;
 
-    while h < max_h {
+    while h < max_h && iter < max_iterations {
+        iter += 1;
         let pres = interp::interp_pressure(profile, h);
+
+        // Guard against NaN propagation — bail out immediately
+        if !pres.is_finite() || !p_t.is_finite() || !h.is_finite() {
+            break;
+        }
 
         // Environment virtual temperature
         let env_t = interp::interp_temp(profile, pres);
@@ -196,6 +204,12 @@ pub fn cape_cin(profile: &SoundingProfile, parcel_type: ParcelType) -> ParcelRes
             thermo::mixing_ratio(p_t, pres)
         };
         let tv_parcel = thermo::virtual_temp(p_t, p_w);
+
+        // Skip if any computation produced NaN
+        if !tv_env.is_finite() || !tv_parcel.is_finite() || tv_env.abs() < 0.01 {
+            h += dz;
+            continue;
+        }
 
         let buoy = thermo::G * (tv_parcel - tv_env) / tv_env * dz;
 
@@ -373,9 +387,17 @@ fn cape_cin_quick(profile: &SoundingProfile, t: f64, td: f64, p: f64) -> ParcelR
     let mut h = sfc_h;
     let mut p_t = t;
     let mut found_pos = false;
+    let max_iterations = ((max_h - sfc_h) / dz) as usize + 100;
+    let mut iter = 0;
 
-    while h < max_h {
+    while h < max_h && iter < max_iterations {
+        iter += 1;
         let pres = interp::interp_pressure(profile, h);
+
+        if !pres.is_finite() || !p_t.is_finite() || !h.is_finite() {
+            break;
+        }
+
         let env_t = interp::interp_temp(profile, pres);
         let env_td = interp::interp_dwpt(profile, pres);
         let env_w = thermo::mixing_ratio(env_td.min(env_t), pres);
@@ -383,6 +405,12 @@ fn cape_cin_quick(profile: &SoundingProfile, t: f64, td: f64, p: f64) -> ParcelR
 
         let p_w = if pres >= lcl_p { parcel_w } else { thermo::mixing_ratio(p_t, pres) };
         let tv_parcel = thermo::virtual_temp(p_t, p_w);
+
+        if !tv_env.is_finite() || !tv_parcel.is_finite() || tv_env.abs() < 0.01 {
+            h += dz;
+            continue;
+        }
+
         let buoy = thermo::G * (tv_parcel - tv_env) / tv_env * dz;
 
         if tv_parcel > tv_env {
@@ -818,16 +846,27 @@ pub fn dcape(profile: &SoundingProfile) -> f64 {
     let mut h = start_h;
     let mut p_t = min_t; // start at dewpoint (saturated)
     let mut dcape_val = 0.0_f64;
+    let max_iterations = ((start_h - sfc_h) / dz) as usize + 100;
+    let mut iter = 0;
 
-    while h > sfc_h {
+    while h > sfc_h && iter < max_iterations {
+        iter += 1;
+        if !h.is_finite() || !p_t.is_finite() {
+            break;
+        }
+
         let pres = interp::interp_pressure(profile, h);
+        if !pres.is_finite() { break; }
+
         let env_t = interp::interp_temp(profile, pres);
 
-        if p_t < env_t {
+        if p_t < env_t && env_t.is_finite() {
             let env_tv = thermo::virtual_temp(env_t, thermo::mixing_ratio(interp::interp_dwpt(profile, pres).min(env_t), pres));
             let p_tv = thermo::virtual_temp(p_t, thermo::mixing_ratio(p_t, pres));
-            let buoy = thermo::G * (p_tv - env_tv) / env_tv * dz;
-            dcape_val += buoy; // negative buoyancy
+            if env_tv.is_finite() && p_tv.is_finite() && env_tv.abs() > 0.01 {
+                let buoy = thermo::G * (p_tv - env_tv) / env_tv * dz;
+                dcape_val += buoy;
+            }
         }
 
         // Moist descent (warming)

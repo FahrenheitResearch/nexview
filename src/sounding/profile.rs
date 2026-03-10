@@ -118,15 +118,21 @@ impl SoundingProfile {
             params: SoundingParams::default(),
         };
         if profile.levels.len() >= 3 {
-            // Use catch_unwind so that bad data doesn't crash the async task
-            // and leave the fetching flag stuck forever. If compute_all panics,
-            // we return a valid profile with default (zeroed) parameters.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::sounding::params::compute_all(&profile)
-            })) {
-                Ok(params) => profile.params = params,
-                Err(_) => {
+            // Use catch_unwind so that bad data doesn't crash the async task.
+            // Also enforce a time limit to prevent infinite loops from NaN data.
+            let profile_clone = profile.clone();
+            let handle = std::thread::spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::sounding::params::compute_all(&profile_clone)
+                }))
+            });
+            match handle.join() {
+                Ok(Ok(params)) => profile.params = params,
+                Ok(Err(_)) => {
                     log::error!("compute_all panicked — using default parameters");
+                }
+                Err(_) => {
+                    log::error!("compute_all thread failed — using default parameters");
                 }
             }
         }

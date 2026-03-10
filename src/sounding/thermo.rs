@@ -61,9 +61,30 @@ pub fn theta(temp_c: f64, pres_mb: f64) -> f64 {
 pub fn theta_e(temp_c: f64, dewpt_c: f64, pres_mb: f64) -> f64 {
     let r = mixing_ratio(dewpt_c, pres_mb) * 1000.0; // g/kg
     let t_k = temp_c + ZEROCNK;
+    let td_k = dewpt_c + ZEROCNK;
+
+    // Guard against division by zero and invalid inputs
+    if !t_k.is_finite() || !td_k.is_finite() || td_k <= 0.0 || t_k <= 0.0 || pres_mb <= 0.0 {
+        return theta(temp_c, pres_mb); // fall back to dry theta
+    }
 
     // Bolton (1980) LCL temperature approximation
-    let t_lcl = 56.0 + 1.0 / (1.0 / (dewpt_c + ZEROCNK - 56.0) + (t_k / (dewpt_c + ZEROCNK)).ln() / 800.0);
+    let denom1 = td_k - 56.0;
+    if denom1.abs() < 0.01 {
+        return theta(temp_c, pres_mb);
+    }
+    let ln_ratio = (t_k / td_k).ln();
+    if !ln_ratio.is_finite() {
+        return theta(temp_c, pres_mb);
+    }
+    let inner = 1.0 / denom1 + ln_ratio / 800.0;
+    if inner.abs() < 1e-10 || !inner.is_finite() {
+        return theta(temp_c, pres_mb);
+    }
+    let t_lcl = 56.0 + 1.0 / inner;
+    if !t_lcl.is_finite() || t_lcl <= 0.0 {
+        return theta(temp_c, pres_mb);
+    }
 
     // Dry potential temperature
     let theta_d = t_k * (1000.0 / pres_mb).powf(0.2854 * (1.0 - 0.00028 * r));
@@ -122,10 +143,34 @@ pub fn lcl_pressure(temp_c: f64, dewpt_c: f64, pres_mb: f64) -> (f64, f64) {
     // Bolton (1980) LCL temperature
     let t_k = temp_c + ZEROCNK;
     let td_k = dewpt_c + ZEROCNK;
-    let t_lcl = 56.0 + 1.0 / (1.0 / (td_k - 56.0) + (t_k / td_k).ln() / 800.0);
+
+    // Guard against division by zero and invalid inputs
+    if !t_k.is_finite() || !td_k.is_finite() || td_k <= 0.0 || t_k <= 0.0 || pres_mb <= 0.0 {
+        return (pres_mb, temp_c);
+    }
+
+    let denom1 = td_k - 56.0;
+    if denom1.abs() < 0.01 {
+        return (pres_mb, temp_c);
+    }
+    let ln_ratio = (t_k / td_k).ln();
+    if !ln_ratio.is_finite() {
+        return (pres_mb, temp_c);
+    }
+    let inner = 1.0 / denom1 + ln_ratio / 800.0;
+    if inner.abs() < 1e-10 || !inner.is_finite() {
+        return (pres_mb, temp_c);
+    }
+    let t_lcl = 56.0 + 1.0 / inner;
+    if !t_lcl.is_finite() || t_lcl <= 0.0 {
+        return (pres_mb, temp_c);
+    }
 
     // LCL pressure from Poisson relation
     let p_lcl = pres_mb * (t_lcl / t_k).powf(CP / RD);
+    if !p_lcl.is_finite() || p_lcl <= 0.0 {
+        return (pres_mb, temp_c);
+    }
 
     (p_lcl, t_lcl - ZEROCNK)
 }
@@ -137,9 +182,14 @@ pub fn lcl_pressure(temp_c: f64, dewpt_c: f64, pres_mb: f64) -> (f64, f64) {
 /// This is the pseudo-adiabatic lapse rate (all condensate falls out).
 pub fn moist_lapse_rate(temp_c: f64, pres_mb: f64) -> f64 {
     let t_k = temp_c + ZEROCNK;
+    if !t_k.is_finite() || t_k <= 0.0 || !pres_mb.is_finite() || pres_mb <= 0.0 {
+        return GAMMA_D;
+    }
     let ws = mixing_ratio(temp_c, pres_mb);
+    if !ws.is_finite() { return GAMMA_D; }
     let numer = 1.0 + LV * ws / (RD * t_k);
     let denom = 1.0 + LV * LV * ws / (CP * RV * t_k * t_k);
+    if !denom.is_finite() || denom.abs() < 1e-10 { return GAMMA_D; }
     GAMMA_D * numer / denom
 }
 
