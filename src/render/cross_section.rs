@@ -16,13 +16,14 @@ pub struct CrossSectionResult {
 /// Effective Earth radius using 4/3 refraction model (km).
 const RE_PRIME_KM: f64 = 6371.0 * 4.0 / 3.0;
 
+/// Standard WSR-88D beamwidth in degrees.
+const BEAMWIDTH_DEG: f64 = 0.95;
+
 impl CrossSectionRenderer {
     /// Render a vertical cross-section along a line from `start` to `end` (lat, lon).
     ///
-    /// Samples every sweep in the volume file along the specified ground track and
-    /// builds a 2-D image where the horizontal axis is ground distance along the
-    /// line and the vertical axis is altitude (0 at the bottom, `max_altitude_km`
-    /// at the top).
+    /// For each pixel, finds the two elevation sweeps that bracket it in altitude
+    /// and interpolates between them, producing a smooth, gap-free image.
     pub fn render_cross_section(
         file: &Level2File,
         product: RadarProduct,
@@ -38,121 +39,102 @@ impl CrossSectionRenderer {
         }
 
         let max_altitude_km: f64 = 20.0;
-
-        // Total ground distance of the cross-section line.
         let total_ground_km = ground_distance_km(start.0, start.1, end.0, end.1);
         if total_ground_km < 0.01 {
             return None;
         }
 
-        // Vertical spread of each data point in pixels – ensures we fill gaps
-        // between elevation tilts.
-        let beam_half_height_px = (height as f64 / file.sweeps.len().max(1) as f64 / 2.0)
-            .ceil() as i32;
-
         let w = width as usize;
         let h = height as usize;
-        let mut pixels = vec![0u8; w * h * 4]; // transparent black
+        let mut pixels = vec![0u8; w * h * 4];
 
-        // For every horizontal column, interpolate a geographic point along the
-        // line, then sample each sweep at that azimuth / range.
+        // For each pixel column, sample at the desired azimuth
         for x in 0..width {
             let t = x as f64 / (width - 1).max(1) as f64;
             let lat = start.0 + t * (end.0 - start.0);
             let lon = start.1 + t * (end.1 - start.1);
-
             let ground_dist_km = ground_distance_km(site.lat, site.lon, lat, lon);
-            let azimuth_deg = azimuth_deg(site.lat, site.lon, lat, lon);
+            let desired_az = azimuth_deg(site.lat, site.lon, lat, lon);
+
+            if ground_dist_km < 0.1 { continue; }
+
+            // Collect (altitude_km, value) samples from all sweeps at this column
+            let mut samples: Vec<(f64, f32)> = Vec::new();
 
             for sweep in &file.sweeps {
-                // Find the radial whose azimuth is closest to the desired azimuth.
-                let radial = sweep.radials.iter().min_by(|a, b| {
-                    let da = azimuth_difference(a.azimuth as f64, azimuth_deg);
-                    let db = azimuth_difference(b.azimuth as f64, azimuth_deg);
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                let radial = match radial {
+                let radial = match find_nearest_radial(sweep, desired_az) {
                     Some(r) => r,
                     None => continue,
                 };
 
-                // Reject if the nearest radial is more than ~1.5 azimuth spacings away.
-                let az_diff = azimuth_difference(radial.azimuth as f64, azimuth_deg);
-                let az_limit = (radial.azimuth_spacing as f64 * 1.5).max(2.0);
-                if az_diff > az_limit {
-                    continue;
-                }
-
-                // Look up the moment data for the requested product.
                 let moment = match radial.moments.iter().find(|m| m.product == product) {
                     Some(m) => m,
                     None => continue,
                 };
 
-                // Compute slant range from ground distance and elevation angle.
                 let elev_rad = (radial.elevation as f64).to_radians();
-                let slant_range_km = if elev_rad.cos().abs() > 1e-6 {
-                    ground_dist_km / elev_rad.cos()
-                } else {
-                    continue;
-                };
+                if elev_rad.cos().abs() <= 1e-6 { continue; }
+                let slant_range_km = ground_dist_km / elev_rad.cos();
+                if slant_range_km < 0.0 { continue; }
 
-                if slant_range_km < 0.0 {
-                    continue;
-                }
+                let value = sample_gate(moment, slant_range_km);
+                if value.is_nan() || value < color_table.min_value { continue; }
 
-                // Which gate index does this slant range correspond to?
-                let first_gate_km = moment.first_gate_range as f64 / 1000.0;
-                let gate_size_km = moment.gate_size as f64 / 1000.0;
-                if gate_size_km <= 0.0 {
-                    continue;
-                }
-                let gate_idx =
-                    ((slant_range_km - first_gate_km) / gate_size_km).round() as i64;
-                if gate_idx < 0 || gate_idx >= moment.gate_count as i64 {
-                    continue;
-                }
+                let alt_km = beam_altitude_km(slant_range_km, elev_rad);
+                if alt_km < 0.0 || alt_km > max_altitude_km { continue; }
 
-                let value = moment.data[gate_idx as usize];
-                if value.is_nan() || value < color_table.min_value {
-                    continue;
-                }
-                let value = value.min(color_table.max_value);
+                // Also compute the beam's vertical extent at this range
+                let half_bw = (BEAMWIDTH_DEG / 2.0).to_radians();
+                let alt_top = beam_altitude_km(slant_range_km, elev_rad + half_bw);
+                let alt_bot = beam_altitude_km(slant_range_km, elev_rad - half_bw);
+                let beam_half_km = (alt_top - alt_bot).abs() / 2.0;
+                // Expand beam to fill gaps: use at least half the spacing to next tilt
+                let expanded_half = beam_half_km.max(0.3);
 
-                // Beam altitude using standard atmospheric refraction formula:
-                //   h = sqrt(r² + Re'² + 2·r·Re'·sin(θ)) − Re'
-                let slant_range_m = slant_range_km * 1000.0;
-                let re_m = RE_PRIME_KM * 1000.0;
-                let altitude_m = ((slant_range_m * slant_range_m)
-                    + (re_m * re_m)
-                    + (2.0 * slant_range_m * re_m * elev_rad.sin()))
-                .sqrt()
-                    - re_m;
-                let altitude_km = altitude_m / 1000.0;
+                samples.push((alt_km, value.min(color_table.max_value)));
+                // Also store the beam extent for gap filling
+                let top = (alt_km + expanded_half).min(max_altitude_km);
+                let bot = (alt_km - expanded_half).max(0.0);
 
-                if altitude_km < 0.0 || altitude_km > max_altitude_km {
-                    continue;
-                }
+                // Fill pixels in this beam's vertical extent
+                let py_top = ((1.0 - top / max_altitude_km) * (h - 1) as f64) as i32;
+                let py_bot = ((1.0 - bot / max_altitude_km) * (h - 1) as f64) as i32;
+                let y_min = py_top.max(0) as usize;
+                let y_max = py_bot.min(h as i32 - 1) as usize;
 
-                // Map altitude to a vertical pixel coordinate (0 = top row, h-1 = bottom).
-                let y_center =
-                    ((1.0 - altitude_km / max_altitude_km) * (h - 1) as f64).round() as i32;
-
-                let color = color_table.color_for_value(value);
-
-                // Paint a small vertical strip to avoid gaps between tilts.
-                let y_min = (y_center - beam_half_height_px).max(0) as usize;
-                let y_max = (y_center + beam_half_height_px).min(h as i32 - 1) as usize;
-
+                let color = color_table.color_for_value(value.min(color_table.max_value));
                 for y in y_min..=y_max {
                     let idx = (y * w + x as usize) * 4;
-                    // Overwrite only if this pixel is still transparent, or if this
-                    // tilt is higher-resolution (prefer data closer to the ground
-                    // which tends to be more detailed).  A simple "first-write-wins"
-                    // approach from lowest elevation up works well when sweeps are
-                    // sorted ascending by elevation.
                     if pixels[idx + 3] == 0 {
+                        pixels[idx] = color[0];
+                        pixels[idx + 1] = color[1];
+                        pixels[idx + 2] = color[2];
+                        pixels[idx + 3] = color[3];
+                    }
+                }
+            }
+
+            // Second pass: interpolate between adjacent sweep samples to fill any remaining gaps
+            if samples.len() >= 2 {
+                samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                for pair in samples.windows(2) {
+                    let (alt0, val0) = pair[0];
+                    let (alt1, val1) = pair[1];
+                    let py0 = ((1.0 - alt0 / max_altitude_km) * (h - 1) as f64) as usize;
+                    let py1 = ((1.0 - alt1 / max_altitude_km) * (h - 1) as f64) as usize;
+                    let (y_top, y_bot) = if py0 < py1 { (py0, py1) } else { (py1, py0) };
+                    for y in y_top..=y_bot.min(h - 1) {
+                        let idx = (y * w + x as usize) * 4;
+                        if pixels[idx + 3] != 0 { continue; } // already filled
+                        // Interpolate
+                        let alt_here = max_altitude_km * (1.0 - y as f64 / (h - 1) as f64);
+                        let t_interp = if (alt1 - alt0).abs() > 0.001 {
+                            ((alt_here - alt0) / (alt1 - alt0)).clamp(0.0, 1.0) as f32
+                        } else {
+                            0.5
+                        };
+                        let val = val0 + (val1 - val0) * t_interp;
+                        let color = color_table.color_for_value(val);
                         pixels[idx] = color[0];
                         pixels[idx + 1] = color[1];
                         pixels[idx + 2] = color[2];
@@ -173,10 +155,8 @@ impl CrossSectionRenderer {
 
     /// Render a 3D perspective view of the radar volume along the cross-section line.
     ///
-    /// Creates an isometric-style 3D rendering showing the cross-section data
-    /// as a vertical slab with a ground plane grid, viewed from a configurable angle.
-    /// `view_angle` is the horizontal rotation in degrees (0 = head-on, 45 = angled).
-    /// `view_pitch` is the vertical tilt in degrees (0 = level, 30 = looking down).
+    /// Uses inverse mapping: for each screen pixel, ray-casts back into the 3D scene
+    /// to find the corresponding data grid cell, producing a fully filled image.
     pub fn render_cross_section_3d(
         file: &Level2File,
         product: RadarProduct,
@@ -199,9 +179,9 @@ impl CrossSectionRenderer {
             return None;
         }
 
-        // First, sample the volume data into a 2D grid (distance x altitude)
-        let grid_w: usize = 400;
-        let grid_h: usize = 200;
+        // Sample the volume data into a 2D grid (distance x altitude)
+        let grid_w: usize = 600;
+        let grid_h: usize = 300;
         let mut grid = vec![f32::NAN; grid_w * grid_h];
 
         for gx in 0..grid_w {
@@ -211,15 +191,16 @@ impl CrossSectionRenderer {
             let ground_dist_km = ground_distance_km(site.lat, site.lon, lat, lon);
             let az = azimuth_deg(site.lat, site.lon, lat, lon);
 
+            if ground_dist_km < 0.1 { continue; }
+
+            // Collect samples for interpolation
+            let mut col_samples: Vec<(f64, f32)> = Vec::new();
+
             for sweep in &file.sweeps {
-                let radial = sweep.radials.iter().min_by(|a, b| {
-                    let da = azimuth_difference(a.azimuth as f64, az);
-                    let db = azimuth_difference(b.azimuth as f64, az);
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let radial = match radial { Some(r) => r, None => continue };
-                let az_diff = azimuth_difference(radial.azimuth as f64, az);
-                if az_diff > (radial.azimuth_spacing as f64 * 1.5).max(2.0) { continue; }
+                let radial = match find_nearest_radial(sweep, az) {
+                    Some(r) => r,
+                    None => continue,
+                };
                 let moment = match radial.moments.iter().find(|m| m.product == product) {
                     Some(m) => m, None => continue,
                 };
@@ -227,40 +208,68 @@ impl CrossSectionRenderer {
                 if elev_rad.cos().abs() <= 1e-6 { continue; }
                 let slant_range_km = ground_dist_km / elev_rad.cos();
                 if slant_range_km < 0.0 { continue; }
-                let first_gate_km = moment.first_gate_range as f64 / 1000.0;
-                let gate_size_km = moment.gate_size as f64 / 1000.0;
-                if gate_size_km <= 0.0 { continue; }
-                let gate_idx = ((slant_range_km - first_gate_km) / gate_size_km).round() as i64;
-                if gate_idx < 0 || gate_idx >= moment.gate_count as i64 { continue; }
-                let value = moment.data[gate_idx as usize];
+                let value = sample_gate(moment, slant_range_km);
                 if value.is_nan() || value < color_table.min_value { continue; }
 
-                let slant_m = slant_range_km * 1000.0;
-                let re_m = RE_PRIME_KM * 1000.0;
-                let alt_m = ((slant_m * slant_m) + (re_m * re_m) + (2.0 * slant_m * re_m * elev_rad.sin())).sqrt() - re_m;
-                let alt_km = alt_m / 1000.0;
+                let alt_km = beam_altitude_km(slant_range_km, elev_rad);
                 if alt_km < 0.0 || alt_km > max_altitude_km { continue; }
 
-                let gy = ((1.0 - alt_km / max_altitude_km) * (grid_h - 1) as f64).round() as usize;
-                if gy < grid_h {
+                // Paint beam extent
+                let half_bw = (BEAMWIDTH_DEG / 2.0).to_radians();
+                let alt_top = beam_altitude_km(slant_range_km, elev_rad + half_bw);
+                let alt_bot = beam_altitude_km(slant_range_km, elev_rad - half_bw);
+                let beam_half = ((alt_top - alt_bot).abs() / 2.0).max(0.3);
+                let top_gy = ((1.0 - (alt_km + beam_half).min(max_altitude_km) / max_altitude_km) * (grid_h - 1) as f64) as usize;
+                let bot_gy = ((1.0 - (alt_km - beam_half).max(0.0) / max_altitude_km) * (grid_h - 1) as f64) as usize;
+                for gy in top_gy..=bot_gy.min(grid_h - 1) {
                     let gi = gy * grid_w + gx;
                     if grid[gi].is_nan() {
                         grid[gi] = value.min(color_table.max_value);
                     }
                 }
+                col_samples.push((alt_km, value.min(color_table.max_value)));
+            }
+
+            // Interpolate between sweep samples
+            if col_samples.len() >= 2 {
+                col_samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                for pair in col_samples.windows(2) {
+                    let (alt0, v0) = pair[0];
+                    let (alt1, v1) = pair[1];
+                    let gy0 = ((1.0 - alt0 / max_altitude_km) * (grid_h - 1) as f64) as usize;
+                    let gy1 = ((1.0 - alt1 / max_altitude_km) * (grid_h - 1) as f64) as usize;
+                    let (top, bot) = if gy0 < gy1 { (gy0, gy1) } else { (gy1, gy0) };
+                    for gy in top..=bot.min(grid_h - 1) {
+                        let gi = gy * grid_w + gx;
+                        if !grid[gi].is_nan() { continue; }
+                        let alt = max_altitude_km * (1.0 - gy as f64 / (grid_h - 1) as f64);
+                        let t_interp = if (alt1 - alt0).abs() > 0.001 {
+                            ((alt - alt0) / (alt1 - alt0)).clamp(0.0, 1.0) as f32
+                        } else { 0.5 };
+                        grid[gi] = v0 + (v1 - v0) * t_interp;
+                    }
+                }
             }
         }
 
-        // Now render the 3D perspective view
+        // Render 3D using inverse mapping
         let w = width as usize;
         let h = height as usize;
         let mut pixels = vec![0u8; w * h * 4];
-        // Dark background
-        for i in 0..w * h {
-            pixels[i * 4] = 12;
-            pixels[i * 4 + 1] = 12;
-            pixels[i * 4 + 2] = 20;
-            pixels[i * 4 + 3] = 255;
+
+        // Dark gradient background
+        for py in 0..h {
+            let t = py as f64 / h as f64;
+            let r = (12.0 + t * 8.0) as u8;
+            let g = (12.0 + t * 6.0) as u8;
+            let b = (20.0 + t * 10.0) as u8;
+            for px in 0..w {
+                let idx = (py * w + px) * 4;
+                pixels[idx] = r;
+                pixels[idx + 1] = g;
+                pixels[idx + 2] = b;
+                pixels[idx + 3] = 255;
+            }
         }
 
         let angle_rad = view_angle.to_radians();
@@ -270,135 +279,129 @@ impl CrossSectionRenderer {
         let cos_p = pitch_rad.cos();
         let sin_p = pitch_rad.sin();
 
-        // 3D coordinate system: X = along cross-section, Y = altitude, Z = depth (perpendicular)
-        // Normalize coordinates to [-1, 1] range for projection
-        let scale_x = total_ground_km;
-        let scale_y = max_altitude_km;
+        // Vertical exaggeration so the slab isn't paper-thin
+        let vert_exag = 2.5;
+        let aspect = total_ground_km / max_altitude_km;
+        let y_scale = vert_exag / aspect.max(1.0);
 
-        // Exaggerate vertical to make structure visible
-        let vert_exaggeration = 3.0;
+        let camera_dist = 3.5;
 
-        // Project a 3D point to 2D screen coordinates (simple perspective)
-        let project = |x3d: f64, y3d: f64, z3d: f64| -> Option<(f64, f64)> {
-            // Rotate around Y axis by view_angle
+        // Forward project: 3D point -> screen
+        let project = |x3d: f64, y3d: f64, z3d: f64| -> Option<(f64, f64, f64)> {
             let rx = x3d * cos_a + z3d * sin_a;
             let ry = y3d;
             let rz = -x3d * sin_a + z3d * cos_a;
-            // Rotate around X axis by pitch
             let fy = ry * cos_p - rz * sin_p;
             let fz = ry * sin_p + rz * cos_p;
-            // Perspective projection
-            let camera_dist = 4.0;
             let depth = fz + camera_dist;
             if depth < 0.1 { return None; }
             let px = rx / depth;
-            let py = -fy / depth; // flip Y so altitude goes up
-            // Map to screen
-            let sx = (px * 1.8 + 0.5) * w as f64;
-            let sy = (py * 1.8 + 0.55) * h as f64;
-            Some((sx, sy))
+            let py = -fy / depth;
+            let sx = (px * 2.0 + 0.5) * w as f64;
+            let sy = (py * 2.0 + 0.5) * h as f64;
+            Some((sx, sy, depth))
         };
 
-        // Helper to draw a line on the pixel buffer
-        let draw_line = |pixels: &mut Vec<u8>, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]| {
-            let dx = (x1 - x0).abs();
-            let dy = (y1 - y0).abs();
-            let sx = if x0 < x1 { 1 } else { -1 };
-            let sy = if y0 < y1 { 1 } else { -1 };
-            let mut err = dx - dy;
-            let mut cx = x0;
-            let mut cy = y0;
-            let steps = (dx + dy).max(1);
-            for _ in 0..=steps {
-                if cx >= 0 && cx < w as i32 && cy >= 0 && cy < h as i32 {
-                    let idx = (cy as usize * w + cx as usize) * 4;
-                    // Alpha blend
-                    let alpha = color[3] as f32 / 255.0;
-                    pixels[idx] = (pixels[idx] as f32 * (1.0 - alpha) + color[0] as f32 * alpha) as u8;
-                    pixels[idx + 1] = (pixels[idx + 1] as f32 * (1.0 - alpha) + color[1] as f32 * alpha) as u8;
-                    pixels[idx + 2] = (pixels[idx + 2] as f32 * (1.0 - alpha) + color[2] as f32 * alpha) as u8;
-                    pixels[idx + 3] = 255;
-                }
-                if cx == x1 && cy == y1 { break; }
-                let e2 = 2 * err;
-                if e2 > -dy { err -= dy; cx += sx; }
-                if e2 < dx { err += dx; cy += sy; }
+        // Inverse: screen -> ray direction, intersect with z=0 plane in world space
+        // We need the inverse of the rotation to get world-space ray
+        let unproject = |sx: f64, sy: f64| -> Option<(f64, f64)> {
+            let px = (sx / w as f64 - 0.5) / 2.0;
+            let py = (sy / h as f64 - 0.5) / 2.0;
+
+            // Ray from camera through this pixel
+            // Camera is at (0, 0, -camera_dist) in rotated space
+            // Pixel is at (px * depth, -py * depth, 0) in rotated space for depth=1 plane
+            // But we need to find the intersection with the z3d=0 plane in world space
+
+            // In rotated space, camera is at origin looking along +Z
+            // A point at screen (px, py) with perspective corresponds to direction (px, -py, 1)
+            // We need to un-rotate this ray and find where z_world = 0
+
+            // The forward transform is:
+            //   rx = x*cos_a + z*sin_a
+            //   ry = y
+            //   rz = -x*sin_a + z*cos_a
+            // Then pitch:
+            //   fy = ry*cos_p - rz*sin_p
+            //   fz = ry*sin_p + rz*cos_p
+            // Screen: sx = rx/depth, sy = -fy/depth, depth = fz + camera_dist
+
+            // For z_world = 0:
+            //   rx = x * cos_a
+            //   rz = -x * sin_a
+            //   fy = y * cos_p - (-x*sin_a) * sin_p = y*cos_p + x*sin_a*sin_p
+            //   fz = y * sin_p + (-x*sin_a) * cos_p = y*sin_p - x*sin_a*cos_p
+            //   depth = fz + camera_dist
+
+            // px = rx / depth = x*cos_a / depth
+            // py = -fy / depth = -(y*cos_p + x*sin_a*sin_p) / depth
+
+            // This is 2 equations, 3 unknowns (x, y, depth). With depth = y*sin_p - x*sin_a*cos_p + camera_dist:
+            // px * depth = x * cos_a
+            // py * depth = -(y * cos_p + x * sin_a * sin_p)
+
+            // Substitute depth:
+            // px * (y*sin_p - x*sin_a*cos_p + camera_dist) = x * cos_a
+            // Expand: px*y*sin_p - px*x*sin_a*cos_p + px*camera_dist = x*cos_a
+            // x*(cos_a + px*sin_a*cos_p) = px*y*sin_p + px*camera_dist  ... (eq1)
+
+            // py * (y*sin_p - x*sin_a*cos_p + camera_dist) = -(y*cos_p + x*sin_a*sin_p)
+            // py*y*sin_p - py*x*sin_a*cos_p + py*camera_dist = -y*cos_p - x*sin_a*sin_p
+            // y*(py*sin_p + cos_p) + x*(-py*sin_a*cos_p + sin_a*sin_p) = -py*camera_dist
+            // y*(py*sin_p + cos_p) + x*sin_a*(sin_p - py*cos_p) = -py*camera_dist  ... (eq2)
+
+            // From eq1: x = (px*y*sin_p + px*camera_dist) / (cos_a + px*sin_a*cos_p)
+            // Substitute into eq2...
+
+            // This is getting complex. Let's just solve numerically using the 2x2 system.
+            // Let A = cos_a + px*sin_a*cos_p, B = px*sin_p, C = px*camera_dist
+            // eq1: A*x - B*y = C
+            // Let D = sin_a*(sin_p - py*cos_p), E = py*sin_p + cos_p, F = -py*camera_dist
+            // eq2: D*x + E*y = F
+
+            let a_coeff = cos_a + px * sin_a * cos_p;
+            let b_coeff = -px * sin_p;
+            let c_val = px * camera_dist;
+            let d_coeff = sin_a * (sin_p - py * cos_p);
+            let e_coeff = py * sin_p + cos_p;
+            let f_val = -py * camera_dist;
+
+            let det = a_coeff * e_coeff - b_coeff * d_coeff;
+            if det.abs() < 1e-10 { return None; }
+
+            let x_world = (c_val * e_coeff - b_coeff * f_val) / det;
+            let y_world = (a_coeff * f_val - c_val * d_coeff) / det;
+
+            // x_world is in [-1, 1] range (normalized cross-section distance)
+            // y_world is in [-y_scale, y_scale] range (normalized altitude)
+            // Map to grid coordinates
+            let gx_f = (x_world + 1.0) / 2.0; // 0 to 1
+            let gy_f = (1.0 - y_world / y_scale) / 2.0; // 0 (top) to 1 (bottom)
+
+            if gx_f < 0.0 || gx_f > 1.0 || gy_f < 0.0 || gy_f > 1.0 {
+                return None;
             }
+
+            Some((gx_f, gy_f))
         };
 
-        // 1. Draw ground plane grid
-        let grid_color = [40, 60, 80, 180];
-        let grid_lines = 10;
-        // Lines along the cross-section direction (constant Z)
-        for iz in 0..=4 {
-            let z = (iz as f64 / 4.0 - 0.5) * 0.4; // shallow depth range
-            for i in 0..grid_lines {
-                let t0 = i as f64 / grid_lines as f64;
-                let t1 = (i + 1) as f64 / grid_lines as f64;
-                let x0_3d = (t0 - 0.5) * 2.0;
-                let x1_3d = (t1 - 0.5) * 2.0;
-                if let (Some((sx0, sy0)), Some((sx1, sy1))) = (
-                    project(x0_3d, -1.0 * vert_exaggeration / (scale_y / scale_x).max(1.0), z),
-                    project(x1_3d, -1.0 * vert_exaggeration / (scale_y / scale_x).max(1.0), z),
-                ) {
-                    draw_line(&mut pixels, sx0 as i32, sy0 as i32, sx1 as i32, sy1 as i32, grid_color);
-                }
-            }
-        }
-        // Lines perpendicular to cross-section (constant X)
-        for ix in 0..=grid_lines {
-            let x = (ix as f64 / grid_lines as f64 - 0.5) * 2.0;
-            let ground_y = -1.0 * vert_exaggeration / (scale_y / scale_x).max(1.0);
-            if let (Some((sx0, sy0)), Some((sx1, sy1))) = (
-                project(x, ground_y, -0.2),
-                project(x, ground_y, 0.2),
-            ) {
-                draw_line(&mut pixels, sx0 as i32, sy0 as i32, sx1 as i32, sy1 as i32, grid_color);
-            }
-        }
-
-        // 2. Draw the cross-section slab — use a Z-buffer approach
-        // For each column in the grid, project each cell and paint it
-        let mut zbuf = vec![f64::MAX; w * h];
-        let norm_y_range = vert_exaggeration / (scale_y / scale_x).max(1.0);
-
-        for gx in 0..grid_w {
-            let x3d = (gx as f64 / (grid_w - 1) as f64 - 0.5) * 2.0;
-            for gy in 0..grid_h {
-                let gi = gy * grid_w + gx;
-                let value = grid[gi];
-                if value.is_nan() { continue; }
-
-                // Map grid Y to 3D Y coordinate
-                let t_y = gy as f64 / (grid_h - 1) as f64; // 0=top, 1=bottom
-                let y3d = (1.0 - 2.0 * t_y) * norm_y_range;
-
-                let z3d = 0.0; // cross-section is at Z=0
-
-                if let Some((sx, sy)) = project(x3d, y3d, z3d) {
-                    let px = sx as i32;
-                    let py = sy as i32;
-                    // Paint a small area to fill gaps
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
-                            let fx = px + dx;
-                            let fy = py + dy;
-                            if fx >= 0 && fx < w as i32 && fy >= 0 && fy < h as i32 {
-                                let si = fy as usize * w + fx as usize;
-                                // Simple depth test (closer to camera = lower fz)
-                                let rx = x3d * cos_a + z3d * sin_a;
-                                let _ry = y3d;
-                                let rz = -x3d * sin_a + z3d * cos_a;
-                                let fz = y3d * sin_p + rz * cos_p + 4.0;
-                                if fz < zbuf[si] {
-                                    zbuf[si] = fz;
-                                    let color = color_table.color_for_value(value);
-                                    let idx = si * 4;
-                                    pixels[idx] = color[0];
-                                    pixels[idx + 1] = color[1];
-                                    pixels[idx + 2] = color[2];
-                                    pixels[idx + 3] = 255;
-                                }
+        // Inverse map every screen pixel
+        for py in 0..h {
+            for px in 0..w {
+                if let Some((gx_f, gy_f)) = unproject(px as f64, py as f64) {
+                    let gx = (gx_f * (grid_w - 1) as f64) as usize;
+                    let gy = (gy_f * (grid_h - 1) as f64) as usize;
+                    if gx < grid_w && gy < grid_h {
+                        let gi = gy * grid_w + gx;
+                        let value = grid[gi];
+                        if !value.is_nan() {
+                            let color = color_table.color_for_value(value);
+                            if color[3] > 0 {
+                                let idx = (py * w + px) * 4;
+                                pixels[idx] = color[0];
+                                pixels[idx + 1] = color[1];
+                                pixels[idx + 2] = color[2];
+                                pixels[idx + 3] = 255;
                             }
                         }
                     }
@@ -406,45 +409,81 @@ impl CrossSectionRenderer {
             }
         }
 
-        // 3. Draw border frame around the cross-section slab
-        let frame_color = [120, 180, 220, 200];
-        let corners = [
-            (-1.0, -norm_y_range, 0.0),
-            (1.0, -norm_y_range, 0.0),
-            (1.0, norm_y_range, 0.0),
-            (-1.0, norm_y_range, 0.0),
+        // Draw grid lines over the data for reference
+        let frame_color = [150, 200, 240, 160];
+        let ground_color = [50, 80, 60, 140];
+
+        // Vertical grid lines (distance markers)
+        for i in 0..=10 {
+            let x3d = (i as f64 / 10.0 - 0.5) * 2.0;
+            for seg in 0..100 {
+                let t0 = seg as f64 / 100.0;
+                let t1 = (seg + 1) as f64 / 100.0;
+                let y0 = (-1.0 + 2.0 * t0) * y_scale;
+                let y1 = (-1.0 + 2.0 * t1) * y_scale;
+                if let (Some((sx0, sy0, _)), Some((sx1, sy1, _))) = (
+                    project(x3d, y0, 0.0), project(x3d, y1, 0.0),
+                ) {
+                    draw_line_aa(&mut pixels, w, h, sx0, sy0, sx1, sy1,
+                        if i == 0 || i == 10 { frame_color } else { [30, 50, 70, 80] });
+                }
+            }
+        }
+
+        // Horizontal grid lines (altitude markers)
+        for i in 0..=4 {
+            let y3d = (-1.0 + 2.0 * i as f64 / 4.0) * y_scale;
+            for seg in 0..100 {
+                let t0 = seg as f64 / 100.0;
+                let t1 = (seg + 1) as f64 / 100.0;
+                let x0 = (t0 - 0.5) * 2.0;
+                let x1 = (t1 - 0.5) * 2.0;
+                if let (Some((sx0, sy0, _)), Some((sx1, sy1, _))) = (
+                    project(x0, y3d, 0.0), project(x1, y3d, 0.0),
+                ) {
+                    draw_line_aa(&mut pixels, w, h, sx0, sy0, sx1, sy1,
+                        if i == 0 { ground_color } else { [30, 50, 70, 80] });
+                }
+            }
+        }
+
+        // Border frame
+        let edges = [
+            ((-1.0, -y_scale, 0.0), (1.0, -y_scale, 0.0)),
+            ((1.0, -y_scale, 0.0), (1.0, y_scale, 0.0)),
+            ((1.0, y_scale, 0.0), (-1.0, y_scale, 0.0)),
+            ((-1.0, y_scale, 0.0), (-1.0, -y_scale, 0.0)),
         ];
-        for i in 0..4 {
-            let (x0, y0, z0) = corners[i];
-            let (x1, y1, z1) = corners[(i + 1) % 4];
-            if let (Some((sx0, sy0)), Some((sx1, sy1))) = (
+        for &((x0, y0, z0), (x1, y1, z1)) in &edges {
+            if let (Some((sx0, sy0, _)), Some((sx1, sy1, _))) = (
                 project(x0, y0, z0), project(x1, y1, z1),
             ) {
-                draw_line(&mut pixels, sx0 as i32, sy0 as i32, sx1 as i32, sy1 as i32, frame_color);
+                draw_line_aa(&mut pixels, w, h, sx0, sy0, sx1, sy1, frame_color);
             }
         }
 
-        // 4. Draw altitude labels on the left edge
-        for i in 0..=4 {
-            let t = i as f64 / 4.0;
-            let alt_km = max_altitude_km * t;
-            let y3d = (-1.0 + 2.0 * t) * norm_y_range;
-            if let Some((sx, sy)) = project(-1.0, y3d, 0.0) {
-                // Draw a small tick mark
-                let tick_x = (sx as i32 - 5).max(0);
-                draw_line(&mut pixels, tick_x, sy as i32, sx as i32, sy as i32, frame_color);
-                // We can't easily draw text in raw pixels, but the tick marks help
+        // Ground plane grid (gives depth perception)
+        for iz in 0..=6 {
+            let z = (iz as f64 / 6.0 - 0.5) * 0.6;
+            if (z - 0.0).abs() < 0.01 { continue; } // skip z=0, that's the data plane
+            for seg in 0..50 {
+                let t0 = seg as f64 / 50.0;
+                let t1 = (seg + 1) as f64 / 50.0;
+                let x0 = (t0 - 0.5) * 2.0;
+                let x1 = (t1 - 0.5) * 2.0;
+                if let (Some((sx0, sy0, _)), Some((sx1, sy1, _))) = (
+                    project(x0, -y_scale, z), project(x1, -y_scale, z),
+                ) {
+                    draw_line_aa(&mut pixels, w, h, sx0, sy0, sx1, sy1, [25, 40, 55, 100]);
+                }
             }
         }
-
-        // 5. Draw distance labels along the bottom edge
-        for i in 0..=4 {
-            let t = i as f64 / 4.0;
-            let x3d = (t - 0.5) * 2.0;
-            let y3d = -norm_y_range;
-            if let Some((sx, sy)) = project(x3d, y3d, 0.0) {
-                let tick_y = (sy as i32 + 5).min(h as i32 - 1);
-                draw_line(&mut pixels, sx as i32, sy as i32, sx as i32, tick_y, frame_color);
+        for ix in 0..=10 {
+            let x = (ix as f64 / 10.0 - 0.5) * 2.0;
+            if let (Some((sx0, sy0, _)), Some((sx1, sy1, _))) = (
+                project(x, -y_scale, -0.3), project(x, -y_scale, 0.3),
+            ) {
+                draw_line_aa(&mut pixels, w, h, sx0, sy0, sx1, sy1, [25, 40, 55, 100]);
             }
         }
 
@@ -455,6 +494,68 @@ impl CrossSectionRenderer {
             max_range_km: total_ground_km,
             max_altitude_km,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Find the nearest radial in a sweep to the desired azimuth, rejecting if too far.
+fn find_nearest_radial<'a>(
+    sweep: &'a crate::nexrad::level2::Level2Sweep,
+    desired_az: f64,
+) -> Option<&'a crate::nexrad::level2::RadialData> {
+    let radial = sweep.radials.iter().min_by(|a, b| {
+        let da = azimuth_difference(a.azimuth as f64, desired_az);
+        let db = azimuth_difference(b.azimuth as f64, desired_az);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    let az_diff = azimuth_difference(radial.azimuth as f64, desired_az);
+    if az_diff > (radial.azimuth_spacing as f64 * 1.5).max(2.0) {
+        return None;
+    }
+    Some(radial)
+}
+
+/// Sample a gate value from moment data at a given slant range.
+fn sample_gate(moment: &crate::nexrad::level2::MomentData, slant_range_km: f64) -> f32 {
+    let first_gate_km = moment.first_gate_range as f64 / 1000.0;
+    let gate_size_km = moment.gate_size as f64 / 1000.0;
+    if gate_size_km <= 0.0 { return f32::NAN; }
+    let gate_f = (slant_range_km - first_gate_km) / gate_size_km;
+    let gate_idx = gate_f.round() as i64;
+    if gate_idx < 0 || gate_idx >= moment.gate_count as i64 { return f32::NAN; }
+    moment.data[gate_idx as usize]
+}
+
+/// Beam center altitude in km using 4/3 Earth radius refraction model.
+fn beam_altitude_km(slant_range_km: f64, elev_rad: f64) -> f64 {
+    let r = slant_range_km * 1000.0;
+    let re = RE_PRIME_KM * 1000.0;
+    let alt_m = ((r * r) + (re * re) + (2.0 * r * re * elev_rad.sin())).sqrt() - re;
+    alt_m / 1000.0
+}
+
+/// Draw a line with alpha blending.
+fn draw_line_aa(pixels: &mut [u8], w: usize, h: usize, x0: f64, y0: f64, x1: f64, y1: f64, color: [u8; 4]) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    let steps = (len * 1.5) as usize;
+    if steps == 0 { return; }
+    let alpha = color[3] as f32 / 255.0;
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        let px = (x0 + dx * t) as i32;
+        let py = (y0 + dy * t) as i32;
+        if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+            let idx = (py as usize * w + px as usize) * 4;
+            pixels[idx] = (pixels[idx] as f32 * (1.0 - alpha) + color[0] as f32 * alpha) as u8;
+            pixels[idx + 1] = (pixels[idx + 1] as f32 * (1.0 - alpha) + color[1] as f32 * alpha) as u8;
+            pixels[idx + 2] = (pixels[idx + 2] as f32 * (1.0 - alpha) + color[2] as f32 * alpha) as u8;
+            pixels[idx + 3] = 255;
+        }
     }
 }
 
@@ -483,8 +584,7 @@ fn azimuth_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     }
 }
 
-/// Absolute angular difference between two azimuths in degrees, in the range
-/// [0, 180].
+/// Absolute angular difference between two azimuths in degrees, in the range [0, 180].
 fn azimuth_difference(a: f64, b: f64) -> f64 {
     let diff = (a - b).abs() % 360.0;
     if diff > 180.0 {
