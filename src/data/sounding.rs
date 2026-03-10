@@ -151,8 +151,9 @@ impl SoundingFetcher {
     /// Kick off an async fetch of a sounding at the given lat/lon.
     ///
     /// Tries multiple data sources in order:
-    /// 1. Iowa Environmental Mesonet (IEM) JSON API — observed soundings
-    /// 2. rucsoundings.noaa.gov GSD format — RAP model soundings
+    /// 1. HRRR model sounding (works at any lat/lon within CONUS)
+    /// 2. Iowa Environmental Mesonet (IEM) JSON API — observed soundings
+    /// 3. rucsoundings.noaa.gov GSD format — RAP model soundings
     pub fn fetch_sounding(&self, lat: f64, lon: f64) {
         // Prevent concurrent fetches.
         {
@@ -198,6 +199,19 @@ async fn fetch_sounding_inner(
     lat: f64,
     lon: f64,
 ) -> Option<SoundingProfile> {
+    // ── Source 1: HRRR model sounding (any lat/lon in CONUS) ──────
+    log::info!("Trying HRRR model sounding at ({lat:.2}, {lon:.2})");
+    match fetch_hrrr_sounding(lat, lon).await {
+        Ok(profile) => {
+            log::info!("HRRR sounding: {} levels at ({:.2}, {:.2})",
+                profile.levels.len(), lat, lon);
+            return Some(profile);
+        }
+        Err(e) => {
+            log::warn!("HRRR sounding failed: {e}");
+        }
+    }
+
     let station = nearest_station(lat, lon);
     let (stn_lat, stn_lon) = station_coords(station);
 
@@ -218,7 +232,7 @@ async fn fetch_sounding_inner(
     }
     timestamps.push(format!("{yesterday}0000"));
 
-    // ── Source 1: IEM JSON API (observed soundings) ──────────
+    // ── Source 2: IEM JSON API (observed soundings) ──────────
     for ts in &timestamps {
         let url = format!(
             "https://mesonet.agron.iastate.edu/json/raob.py?station={station}&ts={ts}"
@@ -245,7 +259,7 @@ async fn fetch_sounding_inner(
         }
     }
 
-    // ── Source 2: rucsoundings.noaa.gov (RAP model) ─────────
+    // ── Source 3: rucsoundings.noaa.gov (RAP model) ─────────
     let url = format!(
         "https://rucsoundings.noaa.gov/get_soundings.cgi?\
          data_source=Op40&latest=latest&start_sounding=latest&\
@@ -273,6 +287,46 @@ async fn fetch_sounding_inner(
 }
 
 use chrono::Timelike;
+
+// ── HRRR model sounding ────────────────────────────────────────────
+
+/// Fetch a model sounding from HRRR pressure level data.
+/// Runs the blocking hrrr-render fetch on a dedicated thread via spawn_blocking.
+async fn fetch_hrrr_sounding(lat: f64, lon: f64) -> Result<SoundingProfile, String> {
+    let result = tokio::task::spawn_blocking(move || {
+        let status_fn = |msg: &str| {
+            log::info!("HRRR sounding: {}", msg);
+        };
+        hrrr_render::sounding::fetch_model_sounding("latest", 0, lat, lon, &status_fn)
+    }).await.map_err(|e| format!("spawn_blocking error: {e}"))?;
+
+    let sounding = result.map_err(|e| format!("HRRR fetch error: {e}"))?;
+
+    // Convert hrrr-render ModelSounding to our SoundingProfile
+    let levels: Vec<SoundingLevel> = sounding.levels.iter()
+        .filter(|l| l.pressure_mb.is_finite() && l.height_m.is_finite()
+            && l.temp_c.is_finite() && l.dewpoint_c.is_finite())
+        .map(|l| SoundingLevel {
+            pressure_mb: l.pressure_mb as f32,
+            height_m: l.height_m as f32,
+            temp_c: l.temp_c as f32,
+            dewpoint_c: l.dewpoint_c as f32,
+            wind_dir: l.wind_dir as f32,
+            wind_speed_kts: l.wind_speed_kts as f32,
+        })
+        .collect();
+
+    if levels.len() < 3 {
+        return Err(format!("HRRR sounding: only {} valid levels", levels.len()));
+    }
+
+    let station = format!("HRRR {:.1},{:.1}", lat, lon);
+    let valid_time = format!("{}z f{:02}",
+        sounding.run_date.get(4..).unwrap_or(&sounding.run_date),
+        sounding.forecast_hour);
+
+    Ok(SoundingProfile::new(levels, station, valid_time, lat, lon))
+}
 
 // ── IEM JSON parser ─────────────────────────────────────────────────
 

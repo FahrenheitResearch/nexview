@@ -48,6 +48,9 @@ pollster = "0.4"
 # Local tile rendering (optional)
 rustmaps = { git = "https://github.com/FahrenheitResearch/rustmaps.git", optional = true }
 
+# HRRR weather model data
+hrrr-render = { git = "https://github.com/FahrenheitResearch/hrrr-render.git", default-features = false }
+
 [features]
 default = ["local-maps"]
 local-maps = ["rustmaps"]

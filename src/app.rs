@@ -1,5 +1,6 @@
 use eframe::egui;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use chrono::{Datelike, NaiveDate};
 use crate::nexrad::{Level2File, RadarProduct, sites};
@@ -59,6 +60,13 @@ impl AppSettings {
             let _ = std::fs::write(SETTINGS_PATH, data);
         }
     }
+}
+
+/// HRRR rendered frame data for the overlay.
+pub struct HrrrFrame {
+    pub pixels: Vec<u8>,  // flat RGBA
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct RadarApp {
@@ -180,6 +188,17 @@ pub struct RadarApp {
     pub sounding_mode: bool,
     pub sounding_texture: Option<egui::TextureHandle>,
     pub sounding_pending: bool,
+
+    // HRRR model overlay
+    pub hrrr_mode: bool,
+    pub hrrr_field_idx: usize,        // index into hrrr_render::fields::FIELDS
+    pub hrrr_composite: Option<String>, // Some("stp") for composite fields
+    pub hrrr_forecast_hour: u8,
+    pub hrrr_texture: Option<egui::TextureHandle>,
+    pub hrrr_tex_size: [u32; 2],
+    pub hrrr_fetching: Arc<Mutex<bool>>,
+    pub hrrr_result: Arc<Mutex<Option<HrrrFrame>>>,
+    pub hrrr_status: Arc<Mutex<String>>,
 
     // Measurement tool
     pub measure_mode: bool,
@@ -416,6 +435,16 @@ impl RadarApp {
             sounding_mode: false,
             sounding_texture: None,
             sounding_pending: false,
+
+            hrrr_mode: false,
+            hrrr_field_idx: 0,
+            hrrr_composite: None,
+            hrrr_forecast_hour: 0,
+            hrrr_texture: None,
+            hrrr_tex_size: [0, 0],
+            hrrr_fetching: Arc::new(Mutex::new(false)),
+            hrrr_result: Arc::new(Mutex::new(None)),
+            hrrr_status: Arc::new(Mutex::new("Ready".to_string())),
 
             measure_mode: false,
             measure_start: None,
@@ -2066,6 +2095,7 @@ impl RadarApp {
         let mut toggle_range_rings = false;
         let mut toggle_detections = false;
         let mut toggle_sounding = false;
+        let mut toggle_hrrr = false;
         let mut toggle_measure = false;
         let mut fetch_latest = false;
         let mut zoom_in = false;
@@ -2184,6 +2214,11 @@ impl RadarApp {
                 toggle_sounding = true;
             }
 
+            // Y: toggle HRRR model overlay
+            if i.key_pressed(egui::Key::Y) {
+                toggle_hrrr = true;
+            }
+
             // +/=: zoom in, -: zoom out
             if i.key_pressed(egui::Key::Plus) {
                 zoom_in = true;
@@ -2222,6 +2257,12 @@ impl RadarApp {
         }
         if toggle_sounding {
             self.sounding_mode = !self.sounding_mode;
+        }
+        if toggle_hrrr {
+            self.hrrr_mode = !self.hrrr_mode;
+            if self.hrrr_mode {
+                self.sounding_mode = false;
+            }
         }
         if toggle_measure {
             self.measure_mode = !self.measure_mode;
@@ -2958,6 +2999,91 @@ impl eframe::App for RadarApp {
             }
         }
 
+        // ── HRRR Model Overlay ──────────────────────────────────
+        if self.hrrr_mode {
+            // Check for incoming HRRR frame
+            {
+                let mut result = self.hrrr_result.lock().unwrap();
+                if let Some(frame) = result.take() {
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [frame.width as usize, frame.height as usize],
+                        &frame.pixels,
+                    );
+                    self.hrrr_texture = Some(ctx.load_texture(
+                        "hrrr_overlay", color_image, egui::TextureOptions::LINEAR,
+                    ));
+                    self.hrrr_tex_size = [frame.width, frame.height];
+                }
+            }
+
+            egui::Window::new("HRRR Model Data")
+                .default_size([900.0, 700.0])
+                .resizable(true)
+                .collapsible(true)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let current_label = if let Some(ref comp) = self.hrrr_composite {
+                            hrrr_render::composite::COMPOSITE_FIELDS.iter()
+                                .find(|c| c.name == comp.as_str())
+                                .map(|c| c.label)
+                                .unwrap_or("Unknown")
+                        } else {
+                            hrrr_render::fields::FIELDS[self.hrrr_field_idx].label
+                        };
+
+                        egui::ComboBox::from_label("Field")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                // Regular fields
+                                for (i, field) in hrrr_render::fields::FIELDS.iter().enumerate() {
+                                    if ui.selectable_label(
+                                        self.hrrr_composite.is_none() && self.hrrr_field_idx == i,
+                                        field.label
+                                    ).clicked() {
+                                        self.hrrr_field_idx = i;
+                                        self.hrrr_composite = None;
+                                    }
+                                }
+                                ui.separator();
+                                // Composite fields
+                                for comp in hrrr_render::composite::COMPOSITE_FIELDS.iter() {
+                                    if ui.selectable_label(
+                                        self.hrrr_composite.as_deref() == Some(comp.name),
+                                        comp.label
+                                    ).clicked() {
+                                        self.hrrr_composite = Some(comp.name.to_string());
+                                    }
+                                }
+                            });
+
+                        ui.add(egui::DragValue::new(&mut self.hrrr_forecast_hour)
+                            .range(0..=48)
+                            .prefix("f")
+                            .speed(0.2));
+
+                        let fetching = *self.hrrr_fetching.lock().unwrap();
+                        if ui.add_enabled(!fetching,
+                            egui::Button::new(if fetching { "Loading..." } else { "Fetch" })
+                        ).clicked() {
+                            self.fetch_hrrr_frame(ctx);
+                        }
+
+                        let status = self.hrrr_status.lock().unwrap().clone();
+                        ui.label(&status);
+                    });
+
+                    // Display the rendered HRRR map
+                    if let Some(ref tex) = self.hrrr_texture {
+                        let available = ui.available_size();
+                        let img_w = self.hrrr_tex_size[0] as f32;
+                        let img_h = self.hrrr_tex_size[1] as f32;
+                        let scale = (available.x / img_w).min(available.y / img_h).min(1.0);
+                        let size = egui::vec2(img_w * scale, img_h * scale);
+                        ui.image(egui::load::SizedTexture::new(tex.id(), size));
+                    }
+                });
+        }
+
         // Help overlay window
         if self.show_help {
             let mut open = self.show_help;
@@ -2982,6 +3108,7 @@ impl eframe::App for RadarApp {
                         ("W",              "Toggle NWS warnings"),
                         ("D",              "Toggle meso/TVS detection"),
                         ("S",              "Toggle sounding mode"),
+                        ("Y",              "Toggle HRRR model overlay"),
                         ("M",              "Toggle measure mode"),
                         ("L",              "Load latest data"),
                         ("Shift+Click",    "Add/remove secondary radar"),
@@ -3221,5 +3348,100 @@ impl RadarApp {
             // Fetch completed but no data — the sounding window will show the "no data" message.
             // Keep sounding_pending true so the window stays open.
         }
+    }
+
+    fn fetch_hrrr_frame(&self, ctx: &egui::Context) {
+        let fetching = Arc::clone(&self.hrrr_fetching);
+        {
+            let mut f = fetching.lock().unwrap();
+            if *f { return; }
+            *f = true;
+        }
+
+        let result = Arc::clone(&self.hrrr_result);
+        let status = Arc::clone(&self.hrrr_status);
+        let field_idx = self.hrrr_field_idx;
+        let composite = self.hrrr_composite.clone();
+        let fhour = self.hrrr_forecast_hour;
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            *status.lock().unwrap() = "Fetching...".to_string();
+            ctx.request_repaint();
+
+            let render_result = if let Some(ref comp_name) = composite {
+                // Composite field
+                match hrrr_render::fetch::parse_run("latest") {
+                    Ok((date, run_hour)) => {
+                        let status_fn = |msg: &str| {
+                            *status.lock().unwrap() = msg.to_string();
+                            ctx.request_repaint();
+                        };
+                        hrrr_render::composite::compute_composite(
+                            comp_name, &date, run_hour, fhour, &status_fn
+                        ).and_then(|(values, _nx, _ny)| {
+                            let comp_def = hrrr_render::composite::COMPOSITE_FIELDS.iter()
+                                .find(|c| c.name == comp_name.as_str())
+                                .ok_or_else(|| std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!("Unknown composite: {}", comp_name)
+                                ))?;
+                            let tmp_field = hrrr_render::fields::FieldDef {
+                                name: comp_def.name,
+                                label: comp_def.label,
+                                unit: comp_def.unit,
+                                discipline: 0, category: 0, number: 0,
+                                idx_name: "", level: "",
+                                value_range: comp_def.value_range,
+                                kelvin_to_fahrenheit: false,
+                                group: comp_def.group,
+                            };
+                            let proj = hrrr_render::render::projection::LambertProjection::hrrr_default();
+                            Ok(hrrr_render::render::render_to_pixels(&values, &tmp_field, &proj, 1799, 1059))
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                // Regular field
+                let field = hrrr_render::fields::FIELDS[field_idx].clone();
+                match hrrr_render::fetch::parse_run("latest") {
+                    Ok((date, run_hour)) => {
+                        *status.lock().unwrap() = format!("Fetching {} f{:02}...", field.label, fhour);
+                        ctx.request_repaint();
+
+                        hrrr_render::fetch::fetch_field(&date, run_hour, fhour, field.idx_name, field.level)
+                            .and_then(|data| hrrr_render::parse_grib2_field(&data))
+                            .map(|(mut values, nx, ny)| {
+                                hrrr_render::fields::convert_values(&field, &mut values);
+                                let proj = hrrr_render::render::projection::LambertProjection::new(
+                                    38.5, 38.5, -97.5, 21.138, -122.72,
+                                    3000.0, 3000.0, nx as u32, ny as u32,
+                                );
+                                hrrr_render::render::render_to_pixels(&values, &field, &proj, 1799, 1059)
+                            })
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+            match render_result {
+                Ok((pixel_buf, img_width, img_height)) => {
+                    let flat: Vec<u8> = pixel_buf.iter()
+                        .flat_map(|c| c.iter().copied()).collect();
+                    *result.lock().unwrap() = Some(HrrrFrame {
+                        pixels: flat,
+                        width: img_width,
+                        height: img_height,
+                    });
+                    *status.lock().unwrap() = "Done".to_string();
+                }
+                Err(e) => {
+                    *status.lock().unwrap() = format!("Error: {}", e);
+                }
+            }
+            *fetching.lock().unwrap() = false;
+            ctx.request_repaint();
+        });
     }
 }
