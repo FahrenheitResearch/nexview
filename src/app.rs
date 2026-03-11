@@ -105,6 +105,7 @@ pub struct RadarApp {
     pub cross_section_3d: bool,
     pub cross_section_view_angle: f64,
     pub cross_section_view_pitch: f64,
+    pub cross_section_voxel_cache: Option<crate::render::cross_section::VoxelGrid>,
 
     // Animation / looping
     pub anim_frames: Vec<Level2File>,
@@ -507,6 +508,7 @@ impl RadarApp {
             cross_section_3d: false,
             cross_section_view_angle: 25.0,
             cross_section_view_pitch: 20.0,
+            cross_section_voxel_cache: None,
 
             secondary_radars: Vec::new(),
 
@@ -3441,11 +3443,32 @@ impl RadarApp {
         let render_prod = self.selected_product.base_product();
         let color_table = self.color_table_manager.resolve(render_prod);
         let result = if self.cross_section_3d {
-            crate::render::CrossSectionRenderer::render_cross_section_3d(
-                file, render_prod, &color_table, site, start, end, 800, 400,
-                self.cross_section_view_angle, self.cross_section_view_pitch,
-            )
+            // Build voxel grid only when needed (line/data changed), cache it
+            let need_rebuild = match &self.cross_section_voxel_cache {
+                Some(cache) => {
+                    (cache.start.0 - start.0).abs() > 1e-6
+                        || (cache.start.1 - start.1).abs() > 1e-6
+                        || (cache.end.0 - end.0).abs() > 1e-6
+                        || (cache.end.1 - end.1).abs() > 1e-6
+                }
+                None => true,
+            };
+            if need_rebuild {
+                self.cross_section_voxel_cache =
+                    crate::render::CrossSectionRenderer::build_voxel_grid(
+                        file, render_prod, &color_table, site, start, end,
+                    );
+            }
+            // Ray-march from cached voxels (fast, parallel)
+            match &self.cross_section_voxel_cache {
+                Some(grid) => crate::render::CrossSectionRenderer::render_from_voxels(
+                    grid, &color_table, 600, 300,
+                    self.cross_section_view_angle, self.cross_section_view_pitch,
+                ),
+                None => None,
+            }
         } else {
+            self.cross_section_voxel_cache = None; // free memory in 2D mode
             crate::render::CrossSectionRenderer::render_cross_section(
                 file, render_prod, &color_table, site, start, end, 800, 300,
             )

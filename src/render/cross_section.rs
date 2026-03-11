@@ -13,6 +13,21 @@ pub struct CrossSectionResult {
     pub max_altitude_km: f64,
 }
 
+/// Cached voxel grid for 3D cross-section rendering.
+/// Building this is expensive; rotating/ray-marching is cheap.
+pub struct VoxelGrid {
+    pub data: Vec<f32>,
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    pub total_ground_km: f64,
+    pub max_altitude_km: f64,
+    pub depth_km: f64,
+    // Cache key: invalidate when these change
+    pub start: (f64, f64),
+    pub end: (f64, f64),
+}
+
 /// Effective Earth radius using 4/3 refraction model (km).
 const RE_PRIME_KM: f64 = 6371.0 * 4.0 / 3.0;
 
@@ -171,24 +186,16 @@ impl CrossSectionRenderer {
         })
     }
 
-    /// Render a true 3D volumetric view of radar data around the cross-section line.
-    ///
-    /// Samples the radar volume across multiple depth slices perpendicular to the
-    /// cross-section line, building a 3D voxel grid. Renders with front-to-back
-    /// ray marching so the volume has real depth and structure visible from any angle.
-    pub fn render_cross_section_3d(
+    /// Build the voxel grid for 3D cross-section (expensive, should be cached).
+    pub fn build_voxel_grid(
         file: &Level2File,
         product: RadarProduct,
         color_table: &ColorTable,
         site: &RadarSite,
         start: (f64, f64),
         end: (f64, f64),
-        width: u32,
-        height: u32,
-        view_angle: f64,
-        view_pitch: f64,
-    ) -> Option<CrossSectionResult> {
-        if file.sweeps.is_empty() || width == 0 || height == 0 {
+    ) -> Option<VoxelGrid> {
+        if file.sweeps.is_empty() {
             return None;
         }
 
@@ -198,30 +205,24 @@ impl CrossSectionRenderer {
             return None;
         }
 
-        // Perpendicular offset direction (rotate line direction 90°)
         let dlat = end.0 - start.0;
         let dlon = end.1 - start.1;
         let line_len_deg = (dlat * dlat + dlon * dlon).sqrt();
         if line_len_deg < 1e-8 { return None; }
-        // Perpendicular unit vector (rotated 90° in lat/lon space)
         let perp_lat = -dlon / line_len_deg;
         let perp_lon = dlat / line_len_deg;
 
-        // Depth extent: sample ±depth_km perpendicular to the line
-        // Use ~20% of the line length as depth, capped at 40km
         let depth_km = (total_ground_km * 0.20).min(40.0).max(5.0);
-        // Convert depth_km to degrees (approximate)
         let depth_deg = depth_km / 111.139;
 
-        // Build 3D voxel grid: [distance x altitude x depth]
-        let vox_x: usize = 200; // along cross-section
-        let vox_y: usize = 100; // altitude
-        let vox_z: usize = 40;  // depth (perpendicular)
+        let vox_x: usize = 160;
+        let vox_y: usize = 80;
+        let vox_z: usize = 32;
         let vox_total = vox_x * vox_y * vox_z;
         let mut voxels = vec![f32::NAN; vox_total];
 
         for gz in 0..vox_z {
-            let z_t = (gz as f64 / (vox_z - 1) as f64) * 2.0 - 1.0; // -1 to 1
+            let z_t = (gz as f64 / (vox_z - 1) as f64) * 2.0 - 1.0;
             let offset_lat = perp_lat * z_t * depth_deg;
             let offset_lon = perp_lon * z_t * depth_deg;
 
@@ -234,7 +235,6 @@ impl CrossSectionRenderer {
 
                 if ground_dist < 0.1 { continue; }
 
-                // Collect sweep samples at this geographic point
                 let mut col_samples: Vec<(f64, f32)> = Vec::new();
 
                 for sweep in &file.sweeps {
@@ -254,7 +254,6 @@ impl CrossSectionRenderer {
                     let alt_km = beam_altitude_km(slant_range_km, elev_rad);
                     if alt_km < 0.0 || alt_km > max_altitude_km { continue; }
 
-                    // Paint beam extent into voxels
                     let half_bw = (BEAMWIDTH_DEG / 2.0).to_radians();
                     let alt_top = beam_altitude_km(slant_range_km, elev_rad + half_bw);
                     let alt_bot = beam_altitude_km(slant_range_km, elev_rad - half_bw);
@@ -294,22 +293,33 @@ impl CrossSectionRenderer {
             }
         }
 
-        // Render with ray marching
+        Some(VoxelGrid {
+            data: voxels,
+            nx: vox_x,
+            ny: vox_y,
+            nz: vox_z,
+            total_ground_km,
+            max_altitude_km,
+            depth_km,
+            start,
+            end,
+        })
+    }
+
+    /// Ray-march the cached voxel grid from a given camera angle (fast, uses rayon).
+    pub fn render_from_voxels(
+        grid: &VoxelGrid,
+        color_table: &ColorTable,
+        width: u32,
+        height: u32,
+        view_angle: f64,
+        view_pitch: f64,
+    ) -> Option<CrossSectionResult> {
+        use rayon::prelude::*;
+
         let w = width as usize;
         let h = height as usize;
-        let mut pixels = vec![0u8; w * h * 4];
-
-        // Gradient background
-        for py in 0..h {
-            let t = py as f64 / h as f64;
-            let r = (10.0 + t * 10.0) as u8;
-            let g = (10.0 + t * 8.0) as u8;
-            let b = (18.0 + t * 14.0) as u8;
-            for px in 0..w {
-                let idx = (py * w + px) * 4;
-                pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
-            }
-        }
+        if w == 0 || h == 0 { return None; }
 
         let angle_rad = view_angle.to_radians();
         let pitch_rad = view_pitch.to_radians();
@@ -319,56 +329,48 @@ impl CrossSectionRenderer {
         let sin_p = pitch_rad.sin();
 
         let vert_exag = 2.5;
-        let aspect = total_ground_km / max_altitude_km;
+        let aspect = grid.total_ground_km / grid.max_altitude_km;
         let y_scale = vert_exag / aspect.max(1.0);
-        let z_scale = depth_km / total_ground_km; // depth relative to width
+        let z_scale = grid.depth_km / grid.total_ground_km;
 
         let camera_dist = 3.8;
 
-        // Project world -> screen
-        let project = |x3d: f64, y3d: f64, z3d: f64| -> Option<(f64, f64, f64)> {
-            let rx = x3d * cos_a + z3d * sin_a;
-            let ry = y3d;
-            let rz = -x3d * sin_a + z3d * cos_a;
-            let fy = ry * cos_p - rz * sin_p;
-            let fz = ry * sin_p + rz * cos_p;
-            let depth = fz + camera_dist;
-            if depth < 0.1 { return None; }
-            let sx = (rx / depth * 2.0 + 0.5) * w as f64;
-            let sy = (-fy / depth * 2.0 + 0.5) * h as f64;
-            Some((sx, sy, depth))
-        };
+        let box_min = [-1.0f64, -y_scale, -z_scale];
+        let box_max = [1.0f64, y_scale, z_scale];
 
-        // Inverse camera rotation (transpose of rotation matrix)
-        // Forward: rotate Y by angle, then X by pitch
-        // Inverse: rotate X by -pitch, then Y by -angle
-        let inv_rotate = |rx: f64, ry: f64, rz: f64| -> (f64, f64, f64) {
-            // Undo pitch (rotate X by -pitch)
-            let uy = ry * cos_p + rz * sin_p;
-            let uz = -ry * sin_p + rz * cos_p;
-            // Undo angle (rotate Y by -angle)
-            let ux = rx * cos_a - uz * sin_a;
-            let wz = rx * sin_a + uz * cos_a;
-            (ux, uy, wz)
-        };
-
-        // Per-pixel ray march through the volume
-        // The voxel box in world space is:
-        //   x: [-1, 1], y: [-y_scale, y_scale], z: [-z_scale, z_scale]
-        let box_min = [-1.0, -y_scale, -z_scale];
-        let box_max = [1.0, y_scale, z_scale];
-
-        // Voxel opacity — semi-transparent so you see depth
         let voxel_alpha = 0.12_f32;
+        let vox_x = grid.nx;
+        let vox_y = grid.ny;
+        let vox_z = grid.nz;
 
-        for py in 0..h {
+        // Pre-compute color LUT from voxel values to avoid per-sample color_table lookups
+        // Quantize value range into 256 bins
+        let lut_size = 256usize;
+        let val_range = color_table.max_value - color_table.min_value;
+        let lut: Vec<[u8; 4]> = (0..lut_size).map(|i| {
+            let v = color_table.min_value + val_range * i as f32 / (lut_size - 1) as f32;
+            color_table.color_for_value(v)
+        }).collect();
+
+        // Parallel ray march per row
+        let row_pixels: Vec<Vec<u8>> = (0..h).into_par_iter().map(|py| {
+            let mut row = vec![0u8; w * 4];
+
+            // Background gradient for this row
+            let t = py as f64 / h as f64;
+            let bg_r = (10.0 + t * 10.0) as u8;
+            let bg_g = (10.0 + t * 8.0) as u8;
+            let bg_b = (18.0 + t * 14.0) as u8;
             for px in 0..w {
-                // Compute ray origin and direction in world space
-                let ndc_x = (px as f64 / w as f64 - 0.5) / 2.0;
-                let ndc_y = (py as f64 / h as f64 - 0.5) / 2.0;
+                let idx = px * 4;
+                row[idx] = bg_r; row[idx + 1] = bg_g; row[idx + 2] = bg_b; row[idx + 3] = 255;
+            }
 
-                // Camera is at (0, 0, -camera_dist) in view space
-                // Ray direction in view space: (ndc_x, -ndc_y, 1.0) (normalized)
+            let ndc_y = (py as f64 / h as f64 - 0.5) / 2.0;
+
+            for px in 0..w {
+                let ndc_x = (px as f64 / w as f64 - 0.5) / 2.0;
+
                 let view_dir_x = ndc_x;
                 let view_dir_y = -ndc_y;
                 let view_dir_z = 1.0;
@@ -377,10 +379,18 @@ impl CrossSectionRenderer {
                 let vdy = view_dir_y / len;
                 let vdz = view_dir_z / len;
 
-                // Transform ray to world space
-                let (dx, dy, dz) = inv_rotate(vdx, vdy, vdz);
-                // Camera origin in view space is (0, 0, -camera_dist)
-                let (ox, oy, oz) = inv_rotate(0.0, 0.0, -camera_dist);
+                // Inverse camera rotation
+                let uy = vdy * cos_p + vdz * sin_p;
+                let uz = -vdy * sin_p + vdz * cos_p;
+                let dx = vdx * cos_a - uz * sin_a;
+                let dy = uy;
+                let dz = vdx * sin_a + uz * cos_a;
+
+                let oy_c = sin_p * (-camera_dist);
+                let oz_c = cos_p * (-camera_dist);
+                let ox = -oz_c * sin_a;
+                let oy = oy_c;
+                let oz = oz_c * cos_a;
 
                 // Ray-box intersection (slab method)
                 let mut t_min = f64::NEG_INFINITY;
@@ -388,10 +398,11 @@ impl CrossSectionRenderer {
                 let ray_o = [ox, oy, oz];
                 let ray_d = [dx, dy, dz];
 
+                let mut miss = false;
                 for axis in 0..3 {
                     if ray_d[axis].abs() < 1e-12 {
                         if ray_o[axis] < box_min[axis] || ray_o[axis] > box_max[axis] {
-                            t_min = f64::INFINITY; // no intersection
+                            miss = true;
                             break;
                         }
                     } else {
@@ -403,11 +414,10 @@ impl CrossSectionRenderer {
                     }
                 }
 
-                if t_min > t_max || t_max < 0.0 { continue; }
+                if miss || t_min > t_max || t_max < 0.0 { continue; }
                 let t_start = t_min.max(0.0);
 
-                // March through the volume
-                let num_steps = 60;
+                let num_steps = 48;
                 let step_size = (t_max - t_start) / num_steps as f64;
 
                 let mut acc_r = 0.0_f32;
@@ -416,34 +426,33 @@ impl CrossSectionRenderer {
                 let mut acc_a = 0.0_f32;
 
                 for step in 0..num_steps {
-                    if acc_a > 0.95 { break; } // early termination
+                    if acc_a > 0.95 { break; }
 
                     let t = t_start + (step as f64 + 0.5) * step_size;
                     let sx = ox + dx * t;
                     let sy = oy + dy * t;
                     let sz = oz + dz * t;
 
-                    // Map world coords to voxel indices
                     let vx_f = (sx - box_min[0]) / (box_max[0] - box_min[0]) * (vox_x - 1) as f64;
-                    let vy_f = (sy - box_min[1]) / (box_max[1] - box_min[1]) * (vox_y - 1) as f64;
-                    // Y is inverted: box_min[1] = bottom (high gy), box_max[1] = top (low gy)
-                    let vy_f = (vox_y - 1) as f64 - vy_f;
+                    let vy_f = (vox_y - 1) as f64 - (sy - box_min[1]) / (box_max[1] - box_min[1]) * (vox_y - 1) as f64;
                     let vz_f = (sz - box_min[2]) / (box_max[2] - box_min[2]) * (vox_z - 1) as f64;
 
-                    let vxi = vx_f.round() as usize;
-                    let vyi = vy_f.round() as usize;
-                    let vzi = vz_f.round() as usize;
+                    let vxi = vx_f as usize;
+                    let vyi = vy_f as usize;
+                    let vzi = vz_f as usize;
 
                     if vxi >= vox_x || vyi >= vox_y || vzi >= vox_z { continue; }
 
                     let vi = (vzi * vox_y + vyi) * vox_x + vxi;
-                    let value = voxels[vi];
+                    let value = grid.data[vi];
                     if value.is_nan() { continue; }
 
-                    let color = color_table.color_for_value(value);
+                    // LUT lookup instead of color_table.color_for_value
+                    let lut_idx = ((value - color_table.min_value) / val_range * (lut_size - 1) as f32)
+                        .clamp(0.0, (lut_size - 1) as f32) as usize;
+                    let color = lut[lut_idx];
                     if color[3] == 0 { continue; }
 
-                    // Front-to-back compositing
                     let cr = color[0] as f32 / 255.0;
                     let cg = color[1] as f32 / 255.0;
                     let cb = color[2] as f32 / 255.0;
@@ -456,19 +465,26 @@ impl CrossSectionRenderer {
                 }
 
                 if acc_a > 0.01 {
-                    let idx = (py * w + px) * 4;
-                    let bg_r = pixels[idx] as f32 / 255.0;
-                    let bg_g = pixels[idx + 1] as f32 / 255.0;
-                    let bg_b = pixels[idx + 2] as f32 / 255.0;
-                    pixels[idx] = ((acc_r + bg_r * (1.0 - acc_a)) * 255.0).min(255.0) as u8;
-                    pixels[idx + 1] = ((acc_g + bg_g * (1.0 - acc_a)) * 255.0).min(255.0) as u8;
-                    pixels[idx + 2] = ((acc_b + bg_b * (1.0 - acc_a)) * 255.0).min(255.0) as u8;
+                    let idx = px * 4;
+                    let bg_rf = row[idx] as f32 / 255.0;
+                    let bg_gf = row[idx + 1] as f32 / 255.0;
+                    let bg_bf = row[idx + 2] as f32 / 255.0;
+                    row[idx] = ((acc_r + bg_rf * (1.0 - acc_a)) * 255.0).min(255.0) as u8;
+                    row[idx + 1] = ((acc_g + bg_gf * (1.0 - acc_a)) * 255.0).min(255.0) as u8;
+                    row[idx + 2] = ((acc_b + bg_bf * (1.0 - acc_a)) * 255.0).min(255.0) as u8;
                 }
             }
+            row
+        }).collect();
+
+        // Flatten rows into final pixel buffer
+        let mut pixels: Vec<u8> = Vec::with_capacity(w * h * 4);
+        for row in &row_pixels {
+            pixels.extend_from_slice(row);
         }
 
-        // Draw wireframe box edges over the volume for reference
-        let frame_color = [120, 180, 230, 140];
+        // Draw wireframe box edges
+        let frame_color = [120u8, 180, 230, 140];
         let box_corners: [(f64, f64, f64); 8] = [
             (box_min[0], box_min[1], box_min[2]),
             (box_max[0], box_min[1], box_min[2]),
@@ -480,14 +496,24 @@ impl CrossSectionRenderer {
             (box_min[0], box_max[1], box_max[2]),
         ];
         let box_edges: [(usize, usize); 12] = [
-            (0,1),(1,2),(2,3),(3,0), // front face
-            (4,5),(5,6),(6,7),(7,4), // back face
-            (0,4),(1,5),(2,6),(3,7), // connecting edges
+            (0,1),(1,2),(2,3),(3,0),
+            (4,5),(5,6),(6,7),(7,4),
+            (0,4),(1,5),(2,6),(3,7),
         ];
+        let project = |x3d: f64, y3d: f64, z3d: f64| -> Option<(f64, f64)> {
+            let rx = x3d * cos_a + z3d * sin_a;
+            let ry = y3d;
+            let rz = -x3d * sin_a + z3d * cos_a;
+            let fy = ry * cos_p - rz * sin_p;
+            let fz = ry * sin_p + rz * cos_p;
+            let depth = fz + camera_dist;
+            if depth < 0.1 { return None; }
+            Some(((rx / depth * 2.0 + 0.5) * w as f64, (-fy / depth * 2.0 + 0.5) * h as f64))
+        };
         for &(a, b) in &box_edges {
             let (ax, ay, az) = box_corners[a];
             let (bx, by, bz) = box_corners[b];
-            if let (Some((sx0, sy0, _)), Some((sx1, sy1, _))) = (
+            if let (Some((sx0, sy0)), Some((sx1, sy1))) = (
                 project(ax, ay, az), project(bx, by, bz),
             ) {
                 draw_line_aa(&mut pixels, w, h, sx0, sy0, sx1, sy1, frame_color);
@@ -498,8 +524,8 @@ impl CrossSectionRenderer {
             pixels,
             width,
             height,
-            max_range_km: total_ground_km,
-            max_altitude_km,
+            max_range_km: grid.total_ground_km,
+            max_altitude_km: grid.max_altitude_km,
         })
     }
 }

@@ -11,3 +11,4 @@ models/
 rustmaps_data/
 scripts/
 test_output/
+nexview-perf.exe
