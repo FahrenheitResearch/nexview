@@ -63,6 +63,15 @@ impl AppSettings {
 }
 
 /// HRRR rendered frame data for the overlay.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum CrossSectionDrag {
+    #[default]
+    None,
+    Start,
+    End,
+    Whole { anchor_start: (f64, f64), anchor_end: (f64, f64) },
+}
+
 pub struct HrrrFrame {
     pub pixels: Vec<u8>,  // flat RGBA
     pub width: u32,
@@ -106,6 +115,7 @@ pub struct RadarApp {
     pub cross_section_view_angle: f64,
     pub cross_section_view_pitch: f64,
     pub cross_section_voxel_cache: Option<crate::render::cross_section::VoxelGrid>,
+    pub cross_section_drag: CrossSectionDrag,
 
     // Animation / looping
     pub anim_frames: Vec<Level2File>,
@@ -509,6 +519,7 @@ impl RadarApp {
             cross_section_view_angle: 25.0,
             cross_section_view_pitch: 20.0,
             cross_section_voxel_cache: None,
+            cross_section_drag: CrossSectionDrag::None,
 
             secondary_radars: Vec::new(),
 
@@ -3306,7 +3317,90 @@ impl RadarApp {
 
         if response.dragged_by(egui::PointerButton::Primary) {
             let delta = response.drag_delta();
-            self.map_view.pan(delta.x as f64, delta.y as f64, screen_w, screen_h);
+
+            // Check if we should drag the cross-section line instead of panning
+            let mut cs_dragging = self.cross_section_drag != CrossSectionDrag::None;
+
+            // On drag start, check if near a cross-section endpoint or line
+            if !cs_dragging && response.drag_started() && !self.cross_section_mode {
+                if let (Some(cs_start), Some(cs_end)) = (self.cross_section_start, self.cross_section_end) {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let (sx, sy) = self.map_view.lat_lon_to_pixel(cs_start.0, cs_start.1, screen_w, screen_h);
+                        let (ex, ey) = self.map_view.lat_lon_to_pixel(cs_end.0, cs_end.1, screen_w, screen_h);
+                        let mx = (pos.x - rect.left()) as f64;
+                        let my = (pos.y - rect.top()) as f64;
+                        let grab_radius = 14.0_f64;
+
+                        let dist_start = ((mx - sx).powi(2) + (my - sy).powi(2)).sqrt();
+                        let dist_end = ((mx - ex).powi(2) + (my - ey).powi(2)).sqrt();
+
+                        if dist_start < grab_radius {
+                            self.cross_section_drag = CrossSectionDrag::Start;
+                            cs_dragging = true;
+                        } else if dist_end < grab_radius {
+                            self.cross_section_drag = CrossSectionDrag::End;
+                            cs_dragging = true;
+                        } else {
+                            // Check distance to line segment
+                            let dist_line = point_to_segment_dist(mx, my, sx, sy, ex, ey);
+                            if dist_line < 10.0 {
+                                self.cross_section_drag = CrossSectionDrag::Whole {
+                                    anchor_start: cs_start,
+                                    anchor_end: cs_end,
+                                };
+                                cs_dragging = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if cs_dragging {
+                if let Some(pos) = response.hover_pos().or_else(|| response.interact_pointer_pos()) {
+                    let mx = (pos.x - rect.left()) as f64;
+                    let my = (pos.y - rect.top()) as f64;
+                    let (lat, lon) = self.map_view.pixel_to_lat_lon(mx, my, screen_w, screen_h);
+
+                    match self.cross_section_drag {
+                        CrossSectionDrag::Start => {
+                            self.cross_section_start = Some((lat, lon));
+                        }
+                        CrossSectionDrag::End => {
+                            self.cross_section_end = Some((lat, lon));
+                        }
+                        CrossSectionDrag::Whole { .. } => {
+                            // Use pixel delta converted to lat/lon delta for smooth movement
+                            let (lat0, lon0) = self.map_view.pixel_to_lat_lon(
+                                mx - delta.x as f64, my - delta.y as f64, screen_w, screen_h);
+                            let dlat = lat - lat0;
+                            let dlon = lon - lon0;
+                            if let Some(ref mut s) = self.cross_section_start {
+                                s.0 += dlat; s.1 += dlon;
+                            }
+                            if let Some(ref mut e) = self.cross_section_end {
+                                e.0 += dlat; e.1 += dlon;
+                            }
+                        }
+                        CrossSectionDrag::None => {}
+                    }
+                    self.render_cross_section_image();
+                }
+            } else {
+                self.map_view.pan(delta.x as f64, delta.y as f64, screen_w, screen_h);
+            }
+        }
+
+        // Release cross-section drag
+        if self.cross_section_drag != CrossSectionDrag::None {
+            let released = response.ctx.input(|i| !i.pointer.button_down(egui::PointerButton::Primary));
+            if released {
+                // Force voxel cache rebuild for 3D on release
+                if self.cross_section_3d {
+                    self.cross_section_voxel_cache = None;
+                    self.render_cross_section_image();
+                }
+                self.cross_section_drag = CrossSectionDrag::None;
+            }
         }
 
         // Ctrl+Click: set tornado prediction target
@@ -3442,8 +3536,11 @@ impl RadarApp {
 
         let render_prod = self.selected_product.base_product();
         let color_table = self.color_table_manager.resolve(render_prod);
+        let dragging_line = self.cross_section_drag != CrossSectionDrag::None;
+
         let result = if self.cross_section_3d {
-            // Build voxel grid only when needed (line/data changed), cache it
+            // During line drag: skip voxel rebuild, use stale cache with low-res render
+            // On release or rotation: rebuild if needed, full-res render
             let need_rebuild = match &self.cross_section_voxel_cache {
                 Some(cache) => {
                     (cache.start.0 - start.0).abs() > 1e-6
@@ -3453,24 +3550,38 @@ impl RadarApp {
                 }
                 None => true,
             };
-            if need_rebuild {
+            if need_rebuild && !dragging_line {
                 self.cross_section_voxel_cache =
                     crate::render::CrossSectionRenderer::build_voxel_grid(
                         file, render_prod, &color_table, site, start, end,
                     );
             }
-            // Ray-march from cached voxels (fast, parallel)
-            match &self.cross_section_voxel_cache {
-                Some(grid) => crate::render::CrossSectionRenderer::render_from_voxels(
-                    grid, &color_table, 600, 300,
-                    self.cross_section_view_angle, self.cross_section_view_pitch,
-                ),
-                None => None,
+            if dragging_line {
+                // During drag: rebuild voxels at low res for fast preview
+                let preview_grid = crate::render::CrossSectionRenderer::build_voxel_grid(
+                    file, render_prod, &color_table, site, start, end,
+                );
+                match &preview_grid {
+                    Some(grid) => crate::render::CrossSectionRenderer::render_from_voxels(
+                        grid, &color_table, 300, 150,
+                        self.cross_section_view_angle, self.cross_section_view_pitch,
+                    ),
+                    None => None,
+                }
+            } else {
+                match &self.cross_section_voxel_cache {
+                    Some(grid) => crate::render::CrossSectionRenderer::render_from_voxels(
+                        grid, &color_table, 600, 300,
+                        self.cross_section_view_angle, self.cross_section_view_pitch,
+                    ),
+                    None => None,
+                }
             }
         } else {
-            self.cross_section_voxel_cache = None; // free memory in 2D mode
+            self.cross_section_voxel_cache = None;
+            let (w, h) = if dragging_line { (400, 150) } else { (800, 300) };
             crate::render::CrossSectionRenderer::render_cross_section(
-                file, render_prod, &color_table, site, start, end, 800, 300,
+                file, render_prod, &color_table, site, start, end, w, h,
             )
         };
 
@@ -3603,22 +3714,54 @@ impl RadarApp {
             let (sx, sy) = self.map_view.lat_lon_to_pixel(start.0, start.1, screen_w, screen_h);
             let start_pos = egui::pos2(rect.left() + sx as f32, rect.top() + sy as f32);
 
-            // Draw start marker
-            ui.painter().circle_filled(start_pos, 6.0, egui::Color32::from_rgb(255, 100, 100));
-
             let end_point = self.cross_section_end.unwrap_or((self.cursor_lat, self.cursor_lon));
             let (ex, ey) = self.map_view.lat_lon_to_pixel(end_point.0, end_point.1, screen_w, screen_h);
             let end_pos = egui::pos2(rect.left() + ex as f32, rect.top() + ey as f32);
 
+            let is_dragging = self.cross_section_drag != CrossSectionDrag::None;
+            let line_color = if is_dragging {
+                egui::Color32::from_rgb(255, 180, 80)
+            } else {
+                egui::Color32::from_rgb(255, 100, 100)
+            };
+
             // Draw line
             ui.painter().line_segment(
                 [start_pos, end_pos],
-                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 100, 100)),
+                egui::Stroke::new(3.0, line_color),
             );
 
-            // Draw end marker
+            // Draw endpoint grab handles
             if self.cross_section_end.is_some() {
-                ui.painter().circle_filled(end_pos, 6.0, egui::Color32::from_rgb(255, 100, 100));
+                let handle_radius = 8.0;
+                let handle_stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+
+                // Start handle
+                ui.painter().circle_filled(start_pos, handle_radius, line_color);
+                ui.painter().circle_stroke(start_pos, handle_radius, handle_stroke);
+
+                // End handle
+                ui.painter().circle_filled(end_pos, handle_radius, line_color);
+                ui.painter().circle_stroke(end_pos, handle_radius, handle_stroke);
+
+                // "Drag to move" hint when hovering near handles (not during active draw)
+                if !self.cross_section_mode && !is_dragging {
+                    if let Some(hover) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                        let dist_start = start_pos.distance(hover);
+                        let dist_end = end_pos.distance(hover);
+                        let dist_line = point_to_segment_dist(
+                            hover.x as f64, hover.y as f64,
+                            start_pos.x as f64, start_pos.y as f64,
+                            end_pos.x as f64, end_pos.y as f64,
+                        );
+                        if dist_start < 14.0 || dist_end < 14.0 || dist_line < 10.0 {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        }
+                    }
+                }
+            } else {
+                // During initial drawing, just show filled circle at start
+                ui.painter().circle_filled(start_pos, 6.0, line_color);
             }
         }
     }
@@ -3724,6 +3867,21 @@ impl RadarApp {
 }
 
 /// Haversine formula for distance (km) and initial bearing (degrees) between two lat/lon points.
+/// Distance from point (px, py) to line segment (ax, ay)-(bx, by) in pixels.
+fn point_to_segment_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-6 {
+        return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+    }
+    let t = ((px - ax) * dx + (py - ay) * dy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let proj_x = ax + t * dx;
+    let proj_y = ay + t * dy;
+    ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
+}
+
 fn haversine_distance_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> (f64, f64) {
     let r = 6371.0; // Earth radius in km
     let lat1_r = lat1.to_radians();
